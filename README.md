@@ -161,9 +161,91 @@
 
 ## 安装
 
-1. 把 `astrbot_plugin_human_like_memory` 整个目录放进 `AstrBot/data/plugins/`
-2. 重启 AstrBot（新插件需要重启才会被扫描）
-3. 到插件配置页按需调整（全部有默认值，装完就能用）
+### 前置要求
+
+| 项 | 要求 | 说明 |
+|---|---|---|
+| AstrBot | **>= 4.18** | 需要 `register_web_api`（面板接口） |
+| Python | >= 3.10 | 用 AstrBot 自带的 venv 就行 |
+| 数据库 | 无 | 自动建 SQLite，不需要额外服务 |
+| Ollama + bge-m3 | 可选 | 语义检索用；不装就纯关键词 |
+| jieba | 可选 | 黑话挖掘用（`tools/mine_slang.py`） |
+
+### 方式一：AstrBot WebUI（推荐）
+
+AstrBot 面板 → **插件** → **安装插件** → 粘贴仓库地址：
+
+```
+https://github.com/lingchenyinmeng/astrbot_plugin_human_like_memory
+```
+
+装完点**重载插件**（或重启 AstrBot）。
+
+### 方式二：手动 clone
+
+```bash
+cd /path/to/AstrBot/data/plugins
+git clone https://github.com/lingchenyinmeng/astrbot_plugin_human_like_memory.git
+```
+
+然后重启 AstrBot（**新插件必须重启才会被扫描，重载不生效**）。
+
+### 方式三：zip 包
+
+解压得到 `astrbot_plugin_human_like_memory/` 整个目录，放进 `data/plugins/`，重启。
+
+### 装完检查
+
+1. 日志里出现这一行：
+
+   ```
+   [human_like_mem] 已启动 | 库: .../plugin_data/astrbot_plugin_human_like_memory/memory.db
+   ```
+
+2. AstrBot 插件列表里能看到 **Human-like Memory**
+3. 点插件页的「页面」，能打开面板（**记忆 / 人物 / 关系 / 质量** 四个标签）
+
+### 数据目录
+
+```
+data/plugin_data/astrbot_plugin_human_like_memory/
+├── memory.db          记忆库（原子 + 对话）
+├── people.db          人库（人物 + 关系 + 底色）
+├── conversations.db   会话映射
+└── slang.json         黑话（跑 mine_slang.py 才有）
+```
+
+**备份就是复制这个目录。** 从旧版升级时，`initialize()` 会自动补新列，不用手动迁移（但仍建议先备份）。
+
+### 可选组件
+
+**语义检索**（大幅提升召回质量）：
+
+```bash
+ollama pull bge-m3
+python tools/build_embeddings.py
+```
+
+建完重载插件，日志出现「语义检索已启用」即成。之后新记忆自动补向量。
+
+**黑话挖掘**（能挖出「沅姐」「鲸宝」这类圈子词）：
+
+```bash
+# 必须用 AstrBot 的 venv（系统 Python 没有 jieba）
+/path/to/astrbot/venv/Scripts/python.exe tools/mine_slang.py --dry-run
+/path/to/astrbot/venv/Scripts/python.exe tools/mine_slang.py --apply
+```
+
+挖出来按群分开存，注入时只给当前群的。
+
+### 跑测试
+
+```bash
+cd data/plugins/astrbot_plugin_human_like_memory
+python -m unittest discover -s tests -v
+```
+
+14 个测试，覆盖 trait 惯性、核心锁、剧变拦截、证据权重、遗忘曲线、库读写。
 
 ## 从 LivingMemory 迁移
 
