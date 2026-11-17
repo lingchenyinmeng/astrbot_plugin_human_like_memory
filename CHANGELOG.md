@@ -1,5 +1,65 @@
 # 更新记录
 
+## 3.7.1 (2026-11-17)
+
+修 Atom 缺字段导致的读库崩溃，并加了防御工具。
+
+### 崩溃
+
+```
+Atom.__init__() got an unexpected keyword argument 'recall_count'
+```
+
+**原因**：`recall_count` / `valence` / `arousal` 三列加进了 SQL 和 `_row_to_atom`，
+但**忘了加到 `Atom` 的 dataclass 字段上**。
+
+这个错只有在「从库里读出一条记忆」时才会触发——
+写库、注入、演化全都正常，直到某次检索命中才炸。
+
+### 为什么测试没抓到
+
+原来的 14 个测试测的是 `_blend` / `Core` / `drift` / `evidence` / `decay`，
+**没有一个真的走「写库 → 读库」**。
+
+### 修
+
+1. `Atom` 补三个字段
+2. 新增 `tests/test_store_roundtrip.py`（3 个测试）：
+   - `test_atom_accepts_new_kwargs` —— 构造函数直接收不到就炸（最便宜的守门）
+   - `test_all_fields_survive` —— 写进去再读出来，所有新列都在
+   - `test_touch_extends_expiry` —— `touch` 真的续命
+
+现在共 17 个测试。
+
+### 新增工具 `tools/audit_fields.py`
+
+静态检查「字段名写错」的三条路径：
+
+| 路径 | 后果 |
+|---|---|
+| `Foo(bar=1)` 里 bar 不存在 | 运行时 TypeError |
+| `from_dict` 里 `cls(bar=...)` | 同上 |
+| `from_dict` 里 `d.get("bar")` | **不报错**，静默取默认值 |
+
+第三条最阴——拼错一个 key，程序照跑，只是那个字段永远是默认值。
+
+跑法：
+
+```bash
+python tools/audit_fields.py
+```
+
+当前结果：普通构造 13 处 / `from_dict` cls 7 处 / `d.get` key 59 处，**全部匹配**。
+
+它默认检查自己 + 兄弟目录的 personality 插件，发现不了就跳过。
+
+### 顺带发现
+
+`touch()` 的续命对大多数记忆是**空操作**：
+`compute_ttl()` 算出来 26 天，`touch` 只续 7 天，`MAX(26,7)=26`。
+
+要让「被想起的事活更久」，`refresh_days` 应该按重要度算而不是固定 7。
+**这个还没改。**
 ## 3.7.0 (2026-11-17)
 
 补上第七项的三件事：黑话挖掘、图谱、短期未完成线索。
