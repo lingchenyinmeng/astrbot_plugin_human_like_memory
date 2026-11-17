@@ -174,6 +174,13 @@ class Atom:
     reinforce_count: int = 0
     ttl_days: float = 2.0
     expires_at: float = 0.0
+    # 被检索命中过几次。`touch()` 会 +1 并顺手续命——
+    # 被反复想起的事不该跟没被想起的一样按时死掉。
+    recall_count: int = 0
+    # 情绪二维（Russell 环形模型）：效价 -1~1、唤醒度 0~1。
+    # nature 说的是「这是什么话」，这两个说的是「这句话什么温度」。
+    valence: float = 0.0
+    arousal: float = 0.0
 
     session_id: str = ""
     persona_id: str = ""
