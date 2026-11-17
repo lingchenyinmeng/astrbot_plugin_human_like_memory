@@ -1046,19 +1046,25 @@ class MemoryStore:
             row = await cursor.fetchone()
         return self._row_to_atom(row) if row else None
 
-    async def touch(self, atom_id: int, *, refresh_days: float = 7.0) -> None:
-        """被检索命中一次：更新访问时间、记一次回忆、顺手续命。
+    async def touch(self, atom_id: int, *, refresh_ratio: float = 1.0) -> None:
+        """被检索命中一次：更新访问时间、记一次回忆、然后**重置**存活时间。
 
-        以前只更新 last_access，expires_at 不动——
-        结果「被反复想起的事」照样按时死掉，这不符合记忆的常识。
+        以前是 `expires_at = MAX(expires_at, now + 7天)`。这个写法有个问题：
+        大多数记忆的 TTL 是 20~30 天，`MAX(26天, 7天)` 还是 26 天——**续命等于没续**。
+
+        改成「回忆一次就重置计时器」（memory_system 的 EDM 也是这么做的）：
+            expires_at = now + ttl_days * refresh_ratio
+
+        `refresh_ratio=1.0` 表示整条 TTL 重来一遍。
         """
         now = time.time()
         async with self._connect() as db:
             await db.execute(
                 "UPDATE atoms SET last_access = ?, "
                 "recall_count = COALESCE(recall_count, 0) + 1, "
-                "expires_at = MAX(expires_at, ?) WHERE id = ?",
-                (now, now + max(0.0, refresh_days) * 86400.0, atom_id),
+                "expires_at = ? + MAX(1.0, COALESCE(ttl_days, 1.0)) * 86400.0 * ? "
+                "WHERE id = ?",
+                (now, now, max(0.1, float(refresh_ratio)), atom_id),
             )
             await db.commit()
 
