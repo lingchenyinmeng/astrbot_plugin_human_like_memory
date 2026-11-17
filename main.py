@@ -138,7 +138,7 @@ class LingguangMemory(Star):
             from .core.people import PeopleStore
 
             self.people_db_path = os.path.join(self.data_dir, "people.db")
-            self.people = PeopleStore(self.people_db_path)
+            self.people = PeopleStore(self.people_db_path, self._cfg())
             await self.people.initialize()
             logger.info(f"[human_like_mem] 人库已接上: {self.people_db_path}")
         except Exception as e:
@@ -787,12 +787,32 @@ class LingguangMemory(Star):
     # ---------- 价值驱动检索（读人格） ----------
 
     def _find_personality_db(self) -> str | None:
-        """人格插件的库。没装也不影响，只是不做加权。"""
-        for p in (
-            r"A:\dafeiyu\astrbot\data\plugin_data\astrbot_plugin_human_like_personality\personality.db",
-        ):
+        """人格插件的库。没装也不影响，只是不做加权。
+
+        路径自动探测：从自己的 data 目录推同级目录，不写死盘符。
+        """
+        try:
+            base = os.path.dirname(self.data_dir)
+            p = os.path.join(
+                base, "astrbot_plugin_human_like_personality", "personality.db"
+            )
             if os.path.isfile(p):
                 return p
+        except Exception:
+            pass
+        # 兜底：从插件代码目录往上找 data/plugin_data
+        try:
+            here = os.path.abspath(__file__)
+            for _ in range(6):
+                here = os.path.dirname(here)
+                p = os.path.join(
+                    here, "data", "plugin_data",
+                    "astrbot_plugin_human_like_personality", "personality.db",
+                )
+                if os.path.isfile(p):
+                    return p
+        except Exception:
+            pass
         return None
 
     async def _read_focus(self, limit: int = 30) -> list[tuple[str, float]]:

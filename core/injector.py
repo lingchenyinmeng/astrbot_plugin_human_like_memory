@@ -52,7 +52,9 @@ class Injector:
         self.config = config or {}
 
     @staticmethod
-    def _format_tones(tones: list[dict], *, limit: int = 200) -> str:
+    def _format_tones(
+        tones: list[dict], *, limit: int = 200, me_name: str = "我"
+    ) -> str:
         """底色段：「我」对别人是什么感受。
 
         单独成段、排在最前、独占 200 字额度——它影响的是语气，
@@ -78,7 +80,7 @@ class Injector:
             return ""
         return (
             "[你的人际关系]\n"
-            "（「我」是铃光，下面是铃光对各人的真实感受）\n"
+            f"（「我」是{me_name}，下面是{me_name}对各人的真实感受）\n"
             + "\n".join(rows)
             + "\n[这些只是你自己的底色，别复述，也别主动说出来；影响语气就行。]"
         )
@@ -150,7 +152,9 @@ class Injector:
             lines.append("最近的事：")
             lines.extend(format_atom(a, now) for a in extras[:5])
 
-        tone_block = self._format_tones(tones or [])
+        tone_block = self._format_tones(
+            tones or [], me_name=str(self.config.get("bot_name") or "我")
+        )
 
         if not lines and not tone_block:
             return ""

@@ -18,7 +18,7 @@ from astrbot.api import logger
 
 from .models import Memory
 
-SYSTEM_PROMPT = """你在帮「铃光」整理记忆。下面是刚刚发生的一段对话，请提炼成一条可长期复用的记忆。
+SYSTEM_PROMPT = """你在帮「{bot_name}」整理记忆。下面是刚刚发生的一段对话，请提炼成一条可长期复用的记忆。
 
 要求：
 1. 用第一人称回顾，但必须写清**谁说了什么**。别人的话不能写成「我」说的。
@@ -80,10 +80,14 @@ class Summarizer:
         if provider is None:
             return ""
         try:
+            # 用 replace 而不是 format：prompt 里有 JSON 示例的 `{`，
+            # format 会把它当占位符抛 KeyError
+            bot_name = str(self.config.get("bot_name") or "我").strip() or "我"
+            sys_prompt = SYSTEM_PROMPT.replace("{bot_name}", bot_name)
             resp = await provider.text_chat(
                 prompt=prompt,
                 contexts=[],
-                system_prompt=SYSTEM_PROMPT,
+                system_prompt=sys_prompt,
             )
             return str(getattr(resp, "completion_text", "") or "")
         except Exception as e:

@@ -15,6 +15,8 @@
 """
 from __future__ import annotations
 
+import re
+
 import hashlib
 import json
 import time
@@ -37,8 +39,10 @@ TAG_KINDS: tuple[str, ...] = ("qq", "real_name", "nickname", "alias", "group_car
 # 来源与可信度
 # 「我」是中心节点：所有关系至少一端是铃光
 ME_ID = "me"
-ME_NAME = "铃光"
-ME_ALIASES = ("铃光", "小光", "我", "光")
+# 默认值故意用中性词。发布版让使用者配 `bot_name` / `bot_aliases`，
+# 不写死某个角色名——不然别人装上去还是叫铃光。
+ME_NAME = "我"
+ME_ALIASES = ("我",)
 
 SOURCE_OWNER = "owner"        # 主人亲口 → 钉死
 SOURCE_OTHER = "other"        # 别人说的 → 照收
@@ -103,8 +107,22 @@ def _unknown_id(key: str) -> str:
 class PeopleStore:
     """人表 + 标签 + 关系边。"""
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, config: dict | None = None):
         self.db_path = db_path
+        conf = config or {}
+        # 「我」叫什么：优先配置，其次用中性默认
+        self.me_name = str(conf.get("bot_name") or "").strip() or "我"
+        raw_alias = conf.get("bot_aliases") or ""
+        if isinstance(raw_alias, (list, tuple)):
+            aliases = [str(x).strip() for x in raw_alias if str(x).strip()]
+        else:
+            aliases = [s.strip() for s in re.split(r"[,，、\s]+", str(raw_alias)) if s.strip()]
+        # 名字本身 + 「我」永远算别名
+        seen = []
+        for a in [self.me_name, "我", *aliases]:
+            if a and a not in seen:
+                seen.append(a)
+        self.me_aliases = tuple(seen)
 
     @asynccontextmanager
     async def _connect(self):
@@ -277,11 +295,11 @@ class PeopleStore:
                 "INSERT OR IGNORE INTO people(person_id, created_at, note, "
                 "is_unknown, last_seen, mention_count, importance, status, is_me) "
                 "VALUES (?, ?, ?, 0, ?, 0, 1.0, 'active', 1)",
-                (ME_ID, time.time(), f"{ME_NAME}自己", time.time()),
+                (ME_ID, time.time(), f"{self.me_name}自己", time.time()),
             )
             # 名字也挂上，方便「铃光」被 resolve 到 me
             # 先查有没有，避免重复插入（person_tags 没有唯一约束）
-            for _alias in ME_ALIASES:
+            for _alias in self.me_aliases:
                 cur = await db.execute(
                     "SELECT tag_id FROM person_tags WHERE person_id = ? AND kind = 'nickname' AND value = ?",
                     (ME_ID, _alias),
@@ -488,7 +506,7 @@ class PeopleStore:
         name = str(name or "").strip()
 
         # 0. 「我」永远是自己，不新建也不合并到别人
-        if name and name in ME_ALIASES:
+        if name and name in self.me_aliases:
             return ME_ID
 
         # 1. 按 QQ 号认（最可靠）

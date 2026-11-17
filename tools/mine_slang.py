@@ -11,7 +11,7 @@
 输出按群分开存：A 群的黑话喂给 B 群，模型只会乱用。
 
 跑法（必须用 AstrBot 的 venv，系统 Python 没装 jieba）：
-    A:\\dafeiyu\\uv\\tools\\astrbot\\Scripts\\python.exe tools/mine_slang.py
+    <AstrBot 的 python> tools/mine_slang.py
     ... --apply     # 写盘
     ... --dry-run   # 只看
 """
@@ -31,8 +31,24 @@ PLUGIN_ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.dirname(PLUGIN_ROOT))
 sys.path.insert(0, PLUGIN_ROOT)
 
-HIST_DB = r"A:\dafeiyu\astrbot\data\data_v4.db"
-OUT_DEFAULT = r"A:\dafeiyu\astrbot\data\plugin_data\astrbot_plugin_human_like_memory\slang.json"
+# 自动探测 AstrBot 的 data 目录：从本文件位置往上找 data/
+def _find_data_dir() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))   # tools/
+    plugin_root = os.path.dirname(here)                 # 插件根
+    # 插件在 data/plugins/<name>/
+    cand = os.path.dirname(os.path.dirname(plugin_root))
+    for _ in range(6):
+        if os.path.basename(cand) == "data" and os.path.isdir(os.path.join(cand, "plugins")):
+            return cand
+        cand = os.path.dirname(cand)
+    return os.path.join(os.getcwd(), "data")
+
+
+_DATA = _find_data_dir()
+HIST_DB = os.path.join(_DATA, "data_v4.db")
+OUT_DEFAULT = os.path.join(
+    _DATA, "plugin_data", "astrbot_plugin_human_like_memory", "slang.json"
+)
 
 # 明显不是黑话的词
 STOP = {
