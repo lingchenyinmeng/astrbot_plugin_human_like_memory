@@ -28,7 +28,7 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.config.astrbot_config import AstrBotConfig
 
-from .core.classifier import build_atoms, extract_context
+from .core.classifier import build_atoms, extract_context, infer_fact_speaker
 from .core.conversation import ConversationStore
 from .core.injector import Injector
 from .core.cues import CueStore
@@ -887,6 +887,28 @@ class LingguangMemory(Star):
         source = "group" if mem.is_group else "private"
         said_at = float(msgs[-1].get("create_time") or time.time()) if msgs else time.time()
 
+        # 逐条事实归属说话人：总结器被要求写成「噩壤说…」「鲸宝说他…」，
+        # 按 fact 开头的名字推断是谁说的，不再整段都算第一个人说的。
+        name_map: dict[str, tuple[str, str]] = {}
+        bot_id = ""
+        bot_name = str(self.conf.get("bot_name") or "").strip() or "铃光"
+        for ident in mem.participant_identities or []:
+            sid = str(ident.get("sender_id") or "").strip()
+            nm = str(ident.get("display_name") or "").strip()
+            if sid and nm:
+                name_map[nm] = (sid, nm)
+            if ident.get("is_bot") and sid:
+                bot_id = sid
+                bot_name = nm or bot_name
+        if self.owner_name and self.owner_id:
+            name_map.setdefault(self.owner_name, (self.owner_id, self.owner_name))
+        fact_who: dict[str, tuple[str, str]] = {}
+        for fact in mem.key_facts:
+            fact_who[fact] = infer_fact_speaker(
+                fact, name_map=name_map, default=(who_id, who_name),
+                bot_id=bot_id, bot_name=bot_name,
+            )
+
         # 上下文
         ctx = extract_context(
             [type("M", (), {"content": m.get("content"), "sender_name": m.get("sender_name")})()
@@ -922,6 +944,8 @@ class LingguangMemory(Star):
             session_id=mem.session_id,
             persona_id=mem.persona_id,
             topic=",".join(mem.topics[:1]),
+            fact_who=fact_who,
+            bot_names=[bot_name],
         )
         # 相关性：这句话是不是对我说的 / 和我有没有关系
         try:

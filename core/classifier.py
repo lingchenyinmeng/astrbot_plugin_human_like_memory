@@ -86,11 +86,14 @@ def classify_layer(
     who_name: str = "",
     source: str = "",
     identities: list[dict] | None = None,
+    bot_names: list[str] | None = None,
 ) -> str:
     """判 layer（谁对谁）。
 
-    加 owner_name 的原因：迁移过来的老记忆 who_id 是空的、只有 who_name，
-    光看 who_id 判不出「这是主人说的」，结果全归到「别人之间」。
+    之前两个坑（2026-11-19 修）：
+    1. 只认「铃光/我」当目标，别人说主人的事（other→owner）没有这一档，全掉进 other_to_other。
+    2. 名字只在句首（startswith）才算提到，名字在中间 / 用代称就漏了，群聊默认 other_to_other。
+    现在：整句找「不是说话人的第一个名字」当目标，补上 other_to_owner。
     """
     owner_name = str(owner_name or "").strip()
     t = str(text or "")
@@ -99,44 +102,91 @@ def classify_layer(
     is_owner = bool(owner and who == owner) or bool(
         owner_name and who_name and owner_name in who_name
     )
-    name_to_id: dict[str, str] = {}
+    bots = {str(x).strip() for x in (bot_names or []) if str(x).strip()} | {"铃光", "我", "自己"}
+
+    # 名字 → (person_id, 是不是 bot)
+    name_to_pid: dict[str, tuple[str, bool]] = {}
     for ident in identities or []:
         if not isinstance(ident, dict):
             continue
         sid = str(ident.get("sender_id") or "").strip()
         if not sid:
             continue
+        isb = bool(ident.get("is_bot"))
         for key in ("display_name", *(ident.get("aliases") or [])):
             k = str(key or "").strip()
             if k:
-                name_to_id[k] = sid
+                name_to_pid[k] = (sid, isb)
+    bot_ids = {sid for sid, isb in name_to_pid.values() if isb}
+    who_is_bot = bool(who and who in bot_ids) or bool(
+        who_name and who_name.strip() in bots
+    )
 
-    # 句子里提到谁？看名字前缀
-    mentioned = ""
-    for name in name_to_id:
-        if name and t.startswith(name):
-            mentioned = name
-            break
+    # 目标：句子里出现的、不是说话人本人的第一个名字
+    target_sid, target_is_bot = "", False
+    for name, (sid, isb) in name_to_pid.items():
+        if not name or name not in t:
+            continue
+        if sid and who and sid == who:
+            continue  # 名字就是说话人，不是目标
+        target_sid, target_is_bot = sid, isb
+        break
 
-    bot_marked = bool(re.search(r"铃光|我|自己", t[:4]))
-    if mentioned:
-        target_is_owner = bool(owner and name_to_id.get(mentioned) == owner)
-        speaker_is_owner = is_owner
-        speaker_is_bot = bot_marked
-        if speaker_is_bot:
-            return "me_to_owner" if target_is_owner else "me_to_other"
-        if speaker_is_owner:
-            return "owner_to_me" if target_is_owner is False and mentioned in ("铃光", "我") else "owner_to_other"
-        return "other_to_me" if mentioned in ("铃光", "我") else "other_to_other"
+    owner_mentioned = bool(owner_name and owner_name in t and not is_owner)
+    bot_mentioned = bool(any(b and b in t for b in bots) and not who_is_bot)
+    target_is_owner = bool(owner and target_sid and target_sid == owner) or owner_mentioned
+    target_is_me = target_is_bot or bot_mentioned
 
-    # 没提名字：按当前说话人推
-    if bot_marked:
-        return "me_to_owner" if is_owner else "me_to_other"
+    if who_is_bot:
+        return "me_to_owner" if target_is_owner else "me_to_other"
     if is_owner:
+        if target_is_me:
+            return "owner_to_me"
+        if target_is_owner:
+            return "owner_to_other"
+        # 点到具体「别人」→ 对别人；什么都没点 → 默认对铃光
+        if target_sid:
+            return "owner_to_other"
         return "owner_to_me"
+    # 说话人是别人
+    if target_is_owner:
+        return "other_to_owner"
+    if target_is_me:
+        return "other_to_me"
     if source == "group":
         return "other_to_other"
     return "other_to_me"
+
+
+def infer_fact_speaker(
+    fact: str,
+    *,
+    name_map: dict[str, tuple[str, str]] | None = None,
+    default: tuple[str, str] = ("", ""),
+    bot_id: str = "",
+    bot_name: str = "",
+) -> tuple[str, str]:
+    """从一条 key_fact 的措辞推出「这话是谁说的」。
+
+    总结器被要求把事实写成「噩壤说…」「鲸宝说他…」这种，所以：
+    - 以「我」或 bot 名字开头 → 铃光自己说的
+    - 以某个已知名字开头 → 那个人说的（取最长匹配，避免「噩」吃掉「噩壤」）
+    - 都推不出 → 用这段对话的第一发言人（default）
+    """
+    t = str(fact or "").strip()
+    if not t:
+        return default
+    bname = str(bot_name or "").strip()
+    if t.startswith("我") or (bname and t.startswith(bname)):
+        return (bot_id, bname or "我")
+    best: tuple[str, str, str] | None = None
+    for nm, (sid, real_name) in (name_map or {}).items():
+        if nm and t.startswith(nm):
+            if best is None or len(nm) > len(best[0]):
+                best = (nm, sid, real_name)
+    if best:
+        return (best[1], best[2])
+    return default
 
 
 # 重要性基线：按「这是什么类型的话」给一个底线值。
@@ -274,8 +324,14 @@ def build_atoms(
     session_id: str = "",
     persona_id: str = "",
     topic: str = "",
+    fact_who: dict[str, tuple[str, str]] | None = None,
+    bot_names: list[str] | None = None,
 ) -> list[Atom]:
-    """把 key_facts 变成带完整标签的原子列表。"""
+    """把 key_facts 变成带完整标签的原子列表。
+
+    fact_who: 每条 fact → (who_id, who_name)，逐条归属说话人；
+    没给的 fact 用默认 who_id/who_name（这段对话的第一发言人）。
+    """
     atoms: list[Atom] = []
     now = time.time()
     for fact in key_facts:
@@ -283,11 +339,15 @@ def build_atoms(
         if not fact:
             continue
 
+        fw = (fact_who or {}).get(fact) or (who_id, who_name)
+        f_who_id, f_who_name = str(fw[0] or ""), str(fw[1] or "")
+
         mtype, tconf = classify_type(fact)
         subtype = classify_subtype(mtype, fact)
         layer = classify_layer(
-            fact, owner_id=owner_id, owner_name=owner_name, who_id=who_id,
-            who_name=who_name, source=source, identities=identities,
+            fact, owner_id=owner_id, owner_name=owner_name, who_id=f_who_id,
+            who_name=f_who_name, source=source, identities=identities,
+            bot_names=bot_names,
         )
 
         # 定性：按 mtype 定基调，正则只细化语气（避免两套规则打架）
@@ -299,7 +359,7 @@ def build_atoms(
 
         privacy = "sensitive" if is_sensitive(fact, mtype, final_nature) else "normal"
         with_owner = bool(
-            owner_id and who_id == owner_id and source == "private"
+            owner_id and f_who_id == owner_id and source == "private"
         )
 
         _affect = classify_affect(final_nature, fact)
@@ -318,15 +378,15 @@ def build_atoms(
             nature_evidence=raw_evidence,
             nature_by=tier_src or "rule",
             nature_ver=0,
-            who_id=who_id,
-            who_name=who_name,
+            who_id=f_who_id,
+            who_name=f_who_name,
             said_at=float(said_at or now),
             context=list(context or []),
             source=source,
             with_owner=with_owner,
             topic=topic,
             evidence=classify_evidence(
-                fact, layer=layer, who_id=who_id,
+                fact, layer=layer, who_id=f_who_id,
                 owner_id=owner_id, source=source,
             ),
             valence=_affect[0],
@@ -350,5 +410,5 @@ def build_atoms(
 
 __all__ = [
     "classify_type", "classify_subtype", "classify_layer",
-    "is_sensitive", "extract_context", "build_atoms",
+    "is_sensitive", "extract_context", "build_atoms", "infer_fact_speaker",
 ]

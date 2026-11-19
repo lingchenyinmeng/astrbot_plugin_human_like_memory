@@ -1,7 +1,7 @@
 name: astrbot_plugin_human_like_memory
 display_name: Human-like Memory
 author: 噩壤
-version: 3.12.2
-desc: 类人长期记忆：新记忆先进短时暂存区，定性后才转正式库。带分区、定性、回溯比对、红线过滤和纠错入口。关键词+可选语义双路检索。v3.9 原文归档/实时采集/自主整理。v3.10 睡眠强化。v3.11 相关性识别。v3.12 记忆回想优化：三层回想、人相关优先、高相关提热区。v3.12.1 话题检索常开。v3.12.2 修复 people.py 先 PRAGMA 后建表导致全新安装抛 no such table 的坑。
+version: 3.12.3
+desc: 类人长期记忆：新记忆先进短时暂存区，定性后才转正式库。带分区、定性、回溯比对、红线过滤和纠错入口。关键词+可选语义双路检索。v3.9 原文归档/实时采集/自主整理。v3.10 睡眠强化。v3.11 相关性识别。v3.12 记忆回想优化。v3.12.2 修 people.py 表顺序坑。v3.12.3 修发言人归属 + 谁对谁：逐条按「X说…」归属说话人，补 other->owner 档，名字整句识别。
 short_desc: 短时暂存 + 定性转正的两层长期记忆
 repo: "https://github.com/lingchenyinmeng/astrbot_plugin_human_like_memory"
