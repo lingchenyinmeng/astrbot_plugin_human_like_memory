@@ -28,11 +28,9 @@ import aiosqlite
 
 from astrbot_plugin_human_like_memory.core.classifier import classify_layer  # noqa: E402
 from astrbot_plugin_human_like_memory.tools.migrate_from_livingmemory import (  # noqa: E402
+    default_owner_id,
     find_data_dir,
 )
-
-OWNER_ID = "3022774897"
-OWNER_NAME = "噩壤"
 
 
 def default_db() -> str | None:
@@ -48,15 +46,15 @@ async def main() -> None:
     ap = argparse.ArgumentParser(description="修 source 为空的记忆")
     ap.add_argument("--db", default=default_db())
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--owner-id", default=OWNER_ID)
-    ap.add_argument("--owner-name", default=OWNER_NAME)
+    ap.add_argument("--owner-id", default="")
+    ap.add_argument("--owner-name", default="")
     args = ap.parse_args()
 
     if not args.db or not os.path.isfile(args.db):
         print(f"[修source] 找不到记忆库: {args.db}")
         raise SystemExit(2)
 
-    owner_id = str(args.owner_id or "").strip()
+    owner_id = str(args.owner_id or "").strip() or default_owner_id()
     owner_name = str(args.owner_name or "").strip()
 
     db = await aiosqlite.connect(args.db)

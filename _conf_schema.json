@@ -220,5 +220,17 @@
     "hint": "逗号分隔，比如「铃光,小光」。这些名字会被认成「我」，不会当成别人。",
     "type": "string",
     "default": ""
+  },
+  "bot_qq": {
+    "description": "机器人自己的 QQ 号",
+    "hint": "用来判断消息有没有 @ 她。留空则只靠名字判断。",
+    "type": "string",
+    "default": ""
+  },
+  "relevance_llm_check": {
+    "description": "相关性兜底判定（about vs unrelated）",
+    "hint": "没 @ 没名字的消息，让模型判一句「是不是在说她的事」。",
+    "type": "bool",
+    "default": true
   }
 }

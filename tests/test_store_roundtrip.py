@@ -40,8 +40,8 @@ class TestAtomRoundTrip(unittest.TestCase):
                 mtype="fact",
                 nature="fact",
                 layer="me_to_owner",
-                who_id="3022774897",
-                who_name="噩壤",
+                who_id="10001",
+                who_name="测试者",
                 importance=0.8,
                 status="active",
                 # 这三个就是出事的那三个

@@ -146,6 +146,39 @@ class ConversationStore:
             rows = await cursor.fetchall()
         return [self._row_to_msg(r) for r in reversed(rows)]
 
+    async def search_messages(
+        self,
+        keyword: str = "",
+        session_id: str = "",
+        limit: int = 20,
+        before_ts: float = 0.0,
+        after_ts: float = 0.0,
+    ) -> list[dict]:
+        """按关键词 / 会话 / 时间段翻原始消息（翻旧账）。时间正序返回。"""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if session_id:
+            clauses.append("session_id = ?")
+            params.append(session_id)
+        if keyword:
+            clauses.append("content LIKE ?")
+            params.append("%" + str(keyword) + "%")
+        if after_ts:
+            clauses.append("create_time >= ?")
+            params.append(float(after_ts))
+        if before_ts:
+            clauses.append("create_time <= ?")
+            params.append(float(before_ts))
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(max(1, min(100, int(limit or 20))))
+        async with self._connect() as db:
+            cursor = await db.execute(
+                f"SELECT * FROM messages {where} ORDER BY id DESC LIMIT ?",
+                params,
+            )
+            rows = await cursor.fetchall()
+        return [self._row_to_msg(r) for r in reversed(rows)]
+
     async def cleanup(self, keep_days: float = 30) -> int:
         """消息正文不必永久保留，总结过就可以清。"""
         cutoff = time.time() - keep_days * 86400
@@ -166,6 +199,14 @@ class ConversationStore:
             except (IndexError, KeyError):
                 return d
 
+        meta_raw = g("metadata", "{}")
+        try:
+            meta = json.loads(meta_raw or "{}")
+            if not isinstance(meta, dict):
+                meta = {}
+        except Exception:
+            meta = {}
+
         return {
             "id": int(g("id", 0) or 0),
             "session_id": str(g("session_id") or ""),
@@ -177,6 +218,7 @@ class ConversationStore:
             "platform": str(g("platform") or ""),
             "is_bot": bool(g("is_bot") or 0),
             "create_time": float(g("create_time") or 0),
+            "metadata": meta,
         }
 
 

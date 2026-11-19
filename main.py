@@ -58,6 +58,11 @@ class LingguangMemory(Star):
         # 底色判断的会话级冷却
         self._tone_checked: dict[str, float] = {}
         self._backfill_seen: set[str] = set()
+        # 睡眠强化
+        self._sleeping = False
+        self._wake_count = 0
+        self._wake_window_start = 0.0
+        self._sleep_task: asyncio.Task | None = None
 
     # ---------- 配置 ----------
 
@@ -262,6 +267,470 @@ class LingguangMemory(Star):
             await self._ask_owner()
         except Exception as e:
             logger.warning(f"[human_like_mem] 问主人失败: {e!r}")
+        # 4. 自主整理：偶尔翻翻最近记下的东西，想一遍（不写记忆，只留感想）
+        try:
+            await self._self_review()
+        except Exception as e:
+            logger.debug(f"[human_like_mem] 自主整理失败: {e!r}")
+        # 5. 睡眠强化：到点了就后台整理 + 强化记忆
+        try:
+            await self._maybe_sleep()
+        except Exception as e:
+            logger.debug(f"[human_like_mem] 睡眠强化触发失败: {e!r}")
+
+    async def _self_review(self) -> None:
+        """自主整理记忆：偶尔把最近动过的记忆翻出来想一遍，感想写进 thoughts.jsonl。
+
+        合并自 lingguang_mind 的「整理记忆」动作——现在这是记忆插件自己该会的事。
+        只写感想、不改记忆，风险低；间隔和开关都在配置里。
+        """
+        if not bool(self.conf.get("self_review_enabled", True)):
+            return
+        if self.store is None:
+            return
+        interval = max(1.0, float(self.conf.get("self_review_interval_hours", 6) or 6)) * 3600
+        state_path = os.path.join(self.data_dir, "self_review_state.json")
+        try:
+            if os.path.isfile(state_path):
+                last = float(json.load(open(state_path, encoding="utf-8")).get("last") or 0)
+                if time.time() - last < interval:
+                    return
+        except Exception:
+            pass
+        try:
+            atoms = await self.store.recent_atoms(
+                hours=float(self.conf.get("self_review_lookback_hours", 72) or 72),
+                limit=int(self.conf.get("self_review_atoms", 12) or 12),
+            )
+        except Exception as e:
+            logger.debug(f"[human_like_mem] 自主整理取记忆失败: {e!r}")
+            return
+        if not atoms:
+            return
+        recent = "\n".join(
+            f"- [{a.nature or '?'}] {str(a.content)[:60]}" for a in atoms
+        )
+        try:
+            provider = self.context.get_using_provider()
+        except Exception:
+            provider = None
+        if provider is None:
+            return
+        try:
+            resp = await provider.text_chat(
+                prompt=(
+                    "你刚翻了翻自己最近记住的事：\n\n"
+                    f"{recent}\n\n"
+                    "用两三句说人话：这些天你记住了什么、有没有发现什么规律、"
+                    "有没有哪条记错了该改。不用改记忆，只是自己想一遍。"
+                ),
+                contexts=[],
+            )
+            thought = str(getattr(resp, "completion_text", "") or "").strip()
+        except Exception as e:
+            logger.debug(f"[human_like_mem] 自主整理生成失败: {e!r}")
+            return
+        if not thought:
+            return
+        try:
+            path = os.path.join(self.data_dir, "thoughts.jsonl")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(
+                    {"ts": time.time(), "thought": thought[:600]}, ensure_ascii=False
+                ) + "\n")
+            json.dump({"last": time.time()}, open(state_path, "w", encoding="utf-8"))
+            logger.info(f"[human_like_mem] 自主整理了一次：{thought[:50]}")
+        except Exception as e:
+            logger.debug(f"[human_like_mem] 写自主整理感想失败: {e!r}")
+
+    # ---------- 相关性识别（这句话是不是对我说的 / 和我有没有关系） ----------
+
+    def _bot_names(self) -> set[str]:
+        names = {str(self.conf.get("bot_name") or "").strip()}
+        raw = str(self.conf.get("bot_aliases") or "")
+        for a in re.split(r"[,，、\s]+", raw):
+            a = a.strip()
+            if a:
+                names.add(a)
+        names.discard("")
+        return names
+
+    def _bot_qq(self) -> str:
+        return str(self.conf.get("bot_qq") or "").strip()
+
+    def _is_at_me(self, event: AstrMessageEvent) -> bool:
+        """消息里有没有 @ 我。"""
+        names = self._bot_names()
+        qq = self._bot_qq()
+        try:
+            from astrbot.core.message.components import At, AtAll
+
+            for comp in event.get_messages() or []:
+                if isinstance(comp, AtAll):
+                    continue  # @全体 不算直接对我
+                if isinstance(comp, At):
+                    if qq and str(comp.qq) == qq:
+                        return True
+                    nm = str(getattr(comp, "name", "") or "").strip()
+                    if nm and nm in names:
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def _text_mentions_me(self, text: str) -> bool:
+        names = self._bot_names()
+        if not names:
+            return False
+        t = str(text or "")
+        return any(n in t for n in names if n)
+
+    async def _detect_relevance(self, msgs: list[dict]) -> str:
+        """这段对话和我的关系：direct / mention / about / unrelated。"""
+        if any(bool((m.get("metadata") or {}).get("at_me")) for m in msgs):
+            return "direct"
+        if any(bool((m.get("metadata") or {}).get("mentions_me")) for m in msgs):
+            return "mention"
+        if bool(self.conf.get("relevance_llm_check", True)):
+            return await self._llm_relevance(msgs)
+        return "unrelated"
+
+    async def _llm_relevance(self, msgs: list[dict]) -> str:
+        """没 @ 没名字的，让模型判这段是不是在说我的事。"""
+        try:
+            provider = self.context.get_using_provider()
+        except Exception:
+            provider = None
+        if provider is None:
+            return "unrelated"
+        lines = "\n".join(
+            f"{m.get('sender_name') or m.get('sender_id')}: {str(m.get('content') or '')[:80]}"
+            for m in msgs[-12:]
+        )
+        try:
+            name = str(self.conf.get("bot_name") or "我").strip() or "我"
+            resp = await provider.text_chat(
+                prompt=(
+                    f"下面是一段群聊记录，判断这段对话和「{name}」有没有关系：\n"
+                    f"{lines}\n\n"
+                    f"- about：在说{name}的事、或和她有关（哪怕没提她名字，比如用「她」「那只鱼」代称）\n"
+                    "- unrelated：和她完全无关，只是群里的闲聊\n"
+                    '只输出 JSON：{"relevance":"about" 或 "unrelated"}'
+                ),
+                contexts=[],
+            )
+            raw = str(getattr(resp, "completion_text", "") or "").strip()
+            obj = self._parse_json_obj(raw)
+            rel = str(obj.get("relevance") or "").strip()
+            return rel if rel in ("about", "unrelated") else "unrelated"
+        except Exception as e:
+            logger.debug(f"[human_like_mem] 相关性判定失败: {e!r}")
+            return "unrelated"
+
+    def _fast_relevance(self, event: AstrMessageEvent, content: str) -> str:
+        """注入门槛用的快速相关性（不调 LLM）：direct / mention / other。"""
+        if self._is_at_me(event):
+            return "direct"
+        if self._text_mentions_me(content):
+            return "mention"
+        return "other"
+
+    async def _mentioned_people_ids(self, query: str) -> set[str]:
+        """从当前消息里找提到的人名，返回 person_id 集合。"""
+        q = str(query or "").strip()
+        if not q or not getattr(self, "people_db_path", ""):
+            return set()
+        out: set[str] = set()
+        try:
+            uri = f"file:{self.people_db_path.replace(os.sep, '/')}?mode=ro"
+            async with aiosqlite.connect(uri, uri=True) as db:
+                cur = await db.execute(
+                    "SELECT person_id, value FROM person_tags "
+                    "WHERE kind IN ('real_name','nickname','alias') AND value != '' LIMIT 2000"
+                )
+                rows = await cur.fetchall()
+            for pid, name in rows:
+                name = str(name or "").strip()
+                if name and len(name) >= 2 and name in q:
+                    out.add(str(pid))
+        except Exception:
+            pass
+        return out
+
+    def _rank_by_people(self, atoms: list[Atom], mentioned: set[str]) -> list[Atom]:
+        """提到的人相关的原子排前面。"""
+        def key(a: Atom) -> tuple:
+            hit = (a.who_id in mentioned) or any(p in mentioned for p in (a.person_ids or []))
+            return (0 if hit else 1, -float(a.importance or 0))
+        return sorted(atoms, key=key)
+
+    async def _promote_recalled(self, atoms: list[Atom], mentioned: set[str]) -> int:
+        """高相关（人相关 或 重要度≥0.75）的长期记忆刷 last_access，提进热区。"""
+        if self.store is None:
+            return 0
+        n = 0
+        for a in atoms:
+            if str(a.status or "") != "active":
+                continue
+            hit = bool(mentioned) and (
+                (a.who_id in mentioned) or any(p in mentioned for p in (a.person_ids or []))
+            )
+            if hit or float(a.importance or 0) >= 0.75:
+                if await self.store.promote_to_hot(a.atom_id):
+                    n += 1
+        return n
+
+    # ---------- 睡眠强化 ----------
+
+    def _in_sleep_window(self) -> bool:
+        """当前是否在睡眠时段。sleep_hours 形如 '1-5'（含跨零点如 '23-6'）。"""
+        raw = str(self.conf.get("sleep_hours", "1-5") or "1-5")
+        try:
+            a, b = raw.split("-")
+            start, end = int(a.strip()), int(b.strip())
+        except Exception:
+            start, end = 1, 5
+        hour = time.localtime().tm_hour
+        if start <= end:
+            return start <= hour < end
+        return hour >= start or hour < end
+
+    def _sleep_state_path(self) -> str:
+        return os.path.join(self.data_dir, "sleep_state.json")
+
+    def _load_sleep_state(self) -> dict:
+        try:
+            if os.path.isfile(self._sleep_state_path()):
+                return json.load(open(self._sleep_state_path(), encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
+
+    def _save_sleep_state(self, state: dict) -> None:
+        try:
+            json.dump(state, open(self._sleep_state_path(), "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.debug(f"[human_like_mem] 存睡眠状态失败: {e!r}")
+
+    def _note_wake(self, event: AstrMessageEvent) -> None:
+        """睡眠中收到主人消息就计数，连续达到阈值（10 分钟 ≥7 条）→ 强制唤醒。"""
+        if not self._sleeping:
+            return
+        try:
+            if str(event.get_sender_id() or "") != self.owner_id:
+                return
+        except Exception:
+            return
+        now = time.time()
+        window = int(self.conf.get("wake_window_minutes", 10) or 10) * 60
+        threshold = int(self.conf.get("wake_threshold", 7) or 7)
+        if now - self._wake_window_start > window:
+            self._wake_count = 0
+            self._wake_window_start = now
+        self._wake_count += 1
+        if self._wake_count >= threshold:
+            self._sleeping = False
+            self._wake_count = 0
+            logger.info("[human_like_mem] 主人连续 %d 条，强制唤醒" % threshold)
+
+    async def _maybe_sleep(self) -> None:
+        """到睡眠窗口、今晚没睡过 → 后台跑一次睡眠整理。"""
+        if not bool(self.conf.get("sleep_enabled", True)):
+            return
+        if self.store is None:
+            return
+        if self._sleeping or (self._sleep_task and not self._sleep_task.done()):
+            return
+        if not self._in_sleep_window():
+            return
+        state = self._load_sleep_state()
+        today = time.strftime("%Y-%m-%d", time.localtime())
+        if state.get("date") == today:
+            return
+        self._sleeping = True
+        self._wake_count = 0
+        self._wake_window_start = time.time()
+        self._sleep_task = asyncio.create_task(self._sleep_consolidate(today), name="lingguang-mem-sleep")
+
+    async def _sleep_consolidate(self, today: str) -> None:
+        """睡眠整理：近几日记忆按情绪强烈排序，强化 + 归因 +（可选）AI 微调。"""
+        started = time.time()
+        woke = False
+        n_total = n_top = boosted = refined = 0
+        self_attr = other_attr = 0
+        try:
+            atoms = await self.store.recent_created(
+                days=float(self.conf.get("sleep_lookback_days", 3) or 3),
+                limit=int(self.conf.get("sleep_lookback_limit", 500) or 500),
+            )
+            n_total = len(atoms)
+            if atoms:
+                atoms.sort(
+                    key=lambda a: abs(float(a.valence or 0)) + float(a.arousal or 0),
+                    reverse=True,
+                )
+                top = atoms[: int(self.conf.get("sleep_top_n", 50) or 50)]
+                n_top = len(top)
+                for a in top:
+                    if not self._sleeping:
+                        woke = True
+                        break
+                    attr = await self._attribution_for(a)
+                    if attr == "self":
+                        self_attr += 1
+                    elif attr == "other":
+                        other_attr += 1
+                    extra = float(self.conf.get("sleep_boost", 0.1) or 0.1)
+                    if attr == "self":
+                        extra *= 1.2
+                    elif attr == "other":
+                        extra *= 0.5
+                    if await self.store.boost_atom(a.atom_id, float(a.importance or 0) + extra, attr):
+                        boosted += 1
+            if not woke and self._sleeping and bool(self.conf.get("sleep_ai_refine", True)):
+                refined = await self._ai_refine(atoms)
+        except Exception as e:
+            logger.warning(f"[human_like_mem] 睡眠整理失败: {e!r}")
+        finally:
+            self._sleeping = False
+            self._sleep_task = None
+            self._write_sleep_log(started, n_total, n_top, boosted, refined, self_attr, other_attr, woke)
+            state = self._load_sleep_state()
+            state["date"] = today
+            self._save_sleep_state(state)
+        logger.info(
+            f"[human_like_mem] 睡眠整理完：共 {n_total} 条，强化 {boosted} 条"
+            f"（自责 {self_attr} / 评价降低 {other_attr}），AI 微调 {refined} 条，"
+            f"被唤醒 {'是' if woke else '否'}"
+        )
+
+    async def _attribution_for(self, atom: Atom) -> str:
+        """责怪归因：看 hlp 的好感（≥60 自责 self，≤40 评价降低 other）。"""
+        if str(atom.nature or "") != "scold":
+            return ""
+        who = str(atom.who_name or atom.who_id or "").strip()
+        if not who:
+            return "ambiguous"
+        aff = await self._read_affection(who)
+        if aff >= 60:
+            return "self"
+        if aff <= 40:
+            return "other"
+        return "ambiguous"
+
+    async def _read_affection(self, person_key: str) -> float:
+        """读 hlp 评价体系里某人的好感。没读到返回 50（中性）。"""
+        pdb = self._find_personality_db()
+        if not pdb:
+            return 50.0
+        try:
+            uri = f"file:{pdb.replace(os.sep, '/')}?mode=ro"
+            async with aiosqlite.connect(uri, uri=True) as db:
+                cur = await db.execute(
+                    "SELECT affection FROM person_ratings "
+                    "WHERE person_key = ? OR name = ? ORDER BY updated_at DESC LIMIT 1",
+                    (person_key, person_key),
+                )
+                row = await cur.fetchone()
+            return float(row[0]) if row else 50.0
+        except Exception:
+            return 50.0
+
+    async def _ai_refine(self, atoms: list[Atom]) -> int:
+        """AI 微调：对情绪最强烈的几条，让模型判重要性/性质要不要改。"""
+        if not atoms:
+            return 0
+        cands = [
+            a for a in atoms[: int(self.conf.get("sleep_ai_refine_top", 8) or 8)]
+            if str(a.nature or "") in ("scold", "praise", "emotion")
+        ]
+        if not cands:
+            return 0
+        try:
+            provider = self.context.get_using_provider()
+        except Exception:
+            provider = None
+        if provider is None:
+            return 0
+        lines = "\n".join(
+            f"{a.atom_id}|{a.nature}|{a.who_name or a.who_id}|{a.importance:.2f}|{str(a.content)[:60]}"
+            for a in cands
+        )
+        try:
+            resp = await provider.text_chat(
+                prompt=(
+                    "下面是几条记忆原子，格式：id|性质|谁说的|重要性|内容。\n"
+                    f"{lines}\n\n"
+                    "判断哪条的重要性该上调/下调（±0.2 内）、哪条性质判错了该改"
+                    "（joke/scold/request/fact/question/emotion）。只改真正该改的，没把握别改。\n"
+                    "输出 JSON：{\"fixes\":[{\"id\":123,\"importance_delta\":0.1,\"new_nature\":\"scold\"}]}"
+                ),
+                contexts=[],
+            )
+            raw = str(getattr(resp, "completion_text", "") or "").strip()
+            obj = self._parse_json_obj(raw)
+        except Exception as e:
+            logger.debug(f"[human_like_mem] AI 微调失败: {e!r}")
+            return 0
+        fixes = obj.get("fixes") if isinstance(obj, dict) else []
+        if not isinstance(fixes, list):
+            return 0
+        applied = 0
+        for fx in fixes:
+            if not isinstance(fx, dict):
+                continue
+            try:
+                aid = int(fx.get("id"))
+            except (TypeError, ValueError):
+                continue
+            atom = next((a for a in cands if a.atom_id == aid), None)
+            if atom is None:
+                continue
+            try:
+                delta = max(-0.2, min(0.2, float(fx.get("importance_delta") or 0)))
+            except (TypeError, ValueError):
+                delta = 0.0
+            new_nature = str(fx.get("new_nature") or "").strip()
+            if new_nature in ("joke", "scold", "request", "fact", "question", "emotion") and new_nature != atom.nature:
+                await self.store.update_nature(aid, new_nature, reason="sleep_ai_refine", changed_by="llm")
+            if abs(delta) > 0.001:
+                await self.store.boost_atom(aid, float(atom.importance or 0) + delta, "")
+            applied += 1
+        return applied
+
+    @staticmethod
+    def _parse_json_obj(raw: str) -> dict:
+        s = str(raw or "").strip()
+        if "```" in s:
+            for seg in s.split("```"):
+                seg = seg.strip()
+                if seg.startswith("json"):
+                    seg = seg[4:].strip()
+                if seg.startswith("{"):
+                    s = seg
+                    break
+        i, j = s.find("{"), s.rfind("}")
+        if i < 0 or j <= i:
+            return {}
+        try:
+            obj = json.loads(s[i : j + 1])
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
+
+    def _write_sleep_log(self, started, n_total, n_top, boosted, refined, self_attr, other_attr, woke) -> None:
+        try:
+            path = os.path.join(self.data_dir, "sleep_log.jsonl")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "ts": time.time(),
+                    "duration": round(time.time() - started, 1),
+                    "total": n_total, "top": n_top, "boosted": boosted,
+                    "refined": refined, "self_blame": self_attr, "other_lowered": other_attr,
+                    "woke": woke,
+                }, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.debug(f"[human_like_mem] 写睡眠日志失败: {e!r}")
 
     async def _index_missing_vectors(self, batch: int = 64) -> int:
         """给还没向量的原子补上（新记忆不会漏掉语义检索）。"""
@@ -302,6 +771,7 @@ class LingguangMemory(Star):
     @filter.event_message_type(filter.EventMessageType.ALL, priority=95)
     async def _capture(self, event: AstrMessageEvent):
         """把每条消息先存下来（不拦、不改）。"""
+        self._note_wake(event)
         if self.conv is None:
             return
         try:
@@ -319,6 +789,10 @@ class LingguangMemory(Star):
                 platform=str(event.get_platform_name() or ""),
                 is_bot=False,
                 create_time=time.time(),
+                metadata={
+                    "at_me": self._is_at_me(event),
+                    "mentions_me": self._text_mentions_me(content),
+                },
             )
             # 够了就总结
             threshold = int(self.conf.get("summary_trigger_messages", 30) or 30)
@@ -327,6 +801,41 @@ class LingguangMemory(Star):
                 asyncio.create_task(self._summarize_session(session_id))
         except Exception as e:
             logger.debug(f"[human_like_mem] 存消息失败: {e!r}")
+
+    @filter.after_message_sent()
+    async def _capture_self(self, event: AstrMessageEvent):
+        """把她自己刚发出去的话也存下来，总结时就能记「她说过什么」。
+
+        之前只收别人的消息，总结器里那句「你自己说过的话也要记」其实没有原文可用。
+        """
+        if self.conv is None:
+            return
+        if not bool(self.conf.get("capture_self", True)):
+            return
+        try:
+            result = event.get_result()
+            text = (result.get_plain_text() if result else "") or ""
+            text = text.strip()
+            session_id = str(event.unified_msg_origin or "")
+            if not session_id or not text:
+                return
+            await self.conv.add_message(
+                session_id,
+                text,
+                sender_id="",
+                sender_name=str(self.conf.get("bot_name", "我") or "我"),
+                role="self",
+                group_id=str(event.get_group_id() or ""),
+                platform=str(event.get_platform_name() or ""),
+                is_bot=True,
+                create_time=time.time(),
+            )
+            threshold = int(self.conf.get("summary_trigger_messages", 30) or 30)
+            n = await self.conv.count_unsummarized(session_id)
+            if n >= threshold:
+                asyncio.create_task(self._summarize_session(session_id))
+        except Exception as e:
+            logger.debug(f"[human_like_mem] 存自己消息失败: {e!r}")
 
     # ---------- 总结 ----------
 
@@ -397,7 +906,7 @@ class LingguangMemory(Star):
             except Exception as e:
                 logger.debug(f"[human_like_mem] 回溯失败: {e!r}")
 
-        return build_atoms(
+        atoms = build_atoms(
             mem.key_facts,
             memory_id=mem.memory_id,
             owner_id=self.owner_id,
@@ -414,6 +923,16 @@ class LingguangMemory(Star):
             persona_id=mem.persona_id,
             topic=",".join(mem.topics[:1]),
         )
+        # 相关性：这句话是不是对我说的 / 和我有没有关系
+        try:
+            rel = await self._detect_relevance(msgs)
+        except Exception:
+            rel = "unrelated"
+        for a in atoms:
+            md = dict(a.metadata or {})
+            md["relevance"] = rel
+            a.metadata = md
+        return atoms
 
     async def _attach_person_ids(self, atoms: list[Atom], identities: list[dict]) -> None:
         """给每条原子挂上人库里的 person_id（不写名字，只写 id）。"""
@@ -691,7 +1210,6 @@ class LingguangMemory(Star):
         except Exception as e:
             logger.debug(f"[human_like_mem] 判断底色失败: {e!r}")
 
-    @filter.on_llm_request()
     async def _read_boundaries(self) -> list[str]:
         """读人格核心层的底线清单。
 
@@ -908,6 +1426,7 @@ class LingguangMemory(Star):
 
     # ---------- 注入 ----------
 
+    @filter.on_llm_request()
     async def _inject(self, event: AstrMessageEvent, req: ProviderRequest):
         if self.store is None or self.injector is None:
             return
@@ -915,15 +1434,23 @@ class LingguangMemory(Star):
             return
         try:
             is_group = "GroupMessage" in str(event.unified_msg_origin or "")
-            hot_n = int(self.conf.get("hot_memory_count", 3) or 3)
             query = str(getattr(event, "message_str", "") or "").strip()
-            # 热记忆按相关性挑（有查询时），没查询才退回「最近动过的」
+            # 相关性门槛：私聊 / @我 / 提我名 → 全量；否则话题检索照跑
+            # （提到一件事就该过一遍回忆，检索不到自然为空、只剩热记忆）
+            rel = self._fast_relevance(event, query)
+            is_full = (not is_group) or rel in ("direct", "mention")
+            hot_n = (
+                int(self.conf.get("hot_memory_count", 3) or 3)
+                if is_full
+                else int(self.conf.get("unrelated_hot_count", 2) or 2)
+            )
+            cold_n = int(self.conf.get("recall_top_k", 5) or 5)
+
+            # 三层回想：热 + 冷（长期库 + 暂存区，search_atoms 已含 candidate）
             hot = await self.store.hot_atoms(query=query, hours=48, limit=hot_n)
             cold = (
-                await self.store.search_atoms(
-                    query, limit=int(self.conf.get("recall_top_k", 5) or 5)
-                )
-                if query
+                await self.store.search_atoms(query, limit=cold_n)
+                if query and cold_n
                 else []
             )
             merged: list[Atom] = []
@@ -933,6 +1460,13 @@ class LingguangMemory(Star):
                     continue
                 seen.add(a.atom_id)
                 merged.append(a)
+            # 人相关优先：聊到谁，关于谁的先冒
+            mentioned = await self._mentioned_people_ids(query)
+            if mentioned:
+                merged = self._rank_by_people(merged, mentioned)
+            # promotion：高相关（人相关/高重要）的长期记忆刷 last_access，提进热区
+            if merged:
+                await self._promote_recalled(merged, mentioned)
             # 价值驱动重排：按「她怕什么、在意什么」把相关的往前挪
             merged = await self._apply_focus(merged)
             tones = []
@@ -1072,6 +1606,39 @@ class LingguangMemory(Star):
             tag = f"[{a.nature}]" if a.nature else ""
             lines.append(f"- ({a.atom_id}) {a.content} {tag}")
             await self.store.touch(a.atom_id)
+        return "\n".join(lines)
+
+    @filter.llm_tool(name="recall_detail")
+    async def recall_detail(
+        self, event: AstrMessageEvent, query: str = "", session_id: str = "", limit: int = 10
+    ):
+        '''翻回原始对话原文。主人问「那天我们具体说了啥」「你原话怎么说的」时用。
+
+        Args:
+            query(string): 关键词，比如「猫」或「生日」
+            session_id(string): 要翻哪段对话，留空 = 当前这段
+            limit(number): 最多返回几条，默认 10
+        '''
+        if self.conv is None:
+            return "对话归档还没准备好。"
+        q = str(query or "").strip()
+        sid = str(session_id or event.unified_msg_origin or "").strip()
+        if not q and not sid:
+            return "要告诉我查什么，或者在哪段对话里翻。"
+        try:
+            msgs = await self.conv.search_messages(
+                keyword=q, session_id=sid, limit=max(1, min(50, int(limit or 10)))
+            )
+        except Exception as e:
+            logger.warning(f"[human_like_mem] recall_detail 失败: {e!r}")
+            return "翻原文的时候出错了。"
+        if not msgs:
+            return "没翻到相关的原文。"
+        lines = []
+        for m in msgs:
+            t = time.strftime("%m-%d %H:%M", time.localtime(float(m.get("create_time") or 0)))
+            who = "我" if m.get("is_bot") else (m.get("sender_name") or m.get("sender_id") or "?")
+            lines.append(f"[{t}] {who}：{str(m.get('content') or '')[:200]}")
         return "\n".join(lines)
 
     @filter.llm_tool(name="remember_this")

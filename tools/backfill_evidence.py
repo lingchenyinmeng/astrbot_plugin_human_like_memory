@@ -27,10 +27,9 @@ from astrbot_plugin_human_like_memory.core.classifier import (  # noqa: E402
     classify_evidence,
 )
 from astrbot_plugin_human_like_memory.tools.migrate_from_livingmemory import (  # noqa: E402
+    default_owner_id,
     find_data_dir,
 )
-
-OWNER_ID = "3022774897"
 
 
 def default_db() -> str | None:
@@ -46,8 +45,9 @@ async def main() -> None:
     ap = argparse.ArgumentParser(description="回填证据分层和情绪二维")
     ap.add_argument("--db", default=default_db())
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--owner-id", default=OWNER_ID)
+    ap.add_argument("--owner-id", default="")
     args = ap.parse_args()
+    owner_id = str(args.owner_id or "").strip() or default_owner_id()
 
     if not args.db or not os.path.isfile(args.db):
         print(f"[回填] 找不到记忆库: {args.db}")
@@ -72,7 +72,7 @@ async def main() -> None:
                 text,
                 layer=str(r["layer"] or ""),
                 who_id=str(r["who_id"] or ""),
-                owner_id=args.owner_id,
+                owner_id=owner_id,
                 source=str(r["source"] or ""),
             )
             v, a = classify_affect(str(r["nature"] or ""), text)

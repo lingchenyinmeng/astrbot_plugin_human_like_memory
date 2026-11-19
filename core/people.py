@@ -167,20 +167,7 @@ class PeopleStore:
                 "importance": "REAL DEFAULT 0.5",
                 "status": "TEXT DEFAULT 'active'",
             }
-            # person_tags 后加的两列（老库补上）
-            cur = await db.execute("PRAGMA table_info(person_tags)")
-            tag_have = {row[1] for row in await cur.fetchall()}
-            tag_added = []
-            for col, decl in (
-                ("status", "TEXT DEFAULT 'guess'"),
-                ("source_raw", "TEXT DEFAULT ''"),
-            ):
-                if col not in tag_have:
-                    await db.execute(f"ALTER TABLE person_tags ADD COLUMN {col} {decl}")
-                    tag_added.append(col)
-            if tag_added:
-                logger.info(f"[human_like_mem] person_tags 迁移：补列 {tag_added}")
-
+            # person_tags 后加的两列（老库补上）——放到建表之后做，见下面
             cur = await db.execute("PRAGMA table_info(people)")
             have = {row[1] for row in await cur.fetchall()}
             added = []
@@ -213,6 +200,20 @@ class PeopleStore:
                 )
                 """
             )
+            # person_tags 后加的两列（老库补上）——建表之后再 PRAGMA/ALTER，
+            # 否则全新空库上 PRAGMA 拿不到列、ALTER 直接 no such table
+            cur = await db.execute("PRAGMA table_info(person_tags)")
+            tag_have = {row[1] for row in await cur.fetchall()}
+            tag_added = []
+            for col, decl in (
+                ("status", "TEXT DEFAULT 'guess'"),
+                ("source_raw", "TEXT DEFAULT ''"),
+            ):
+                if col not in tag_have:
+                    await db.execute(f"ALTER TABLE person_tags ADD COLUMN {col} {decl}")
+                    tag_added.append(col)
+            if tag_added:
+                logger.info(f"[human_like_mem] person_tags 迁移：补列 {tag_added}")
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS relations (

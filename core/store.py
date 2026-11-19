@@ -317,7 +317,7 @@ class MemoryStore:
                     participants, participant_identities, sentiment, importance,
                     session_id, persona_id, source_session_id, is_group,
                     create_time, status, metadata
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     mem.content, mem.summary, mem.personality_summary,
@@ -702,6 +702,13 @@ class MemoryStore:
                 elif atom.status == AtomStatus.CANDIDATE.value:
                     s *= float(self.config.get("staging_recall_penalty", 0.5) or 0.5)
                 s *= max(0.1, float(atom.importance or 0.5))
+                rel = str((atom.metadata or {}).get("relevance") or "")
+                if rel == "unrelated":
+                    s *= 0.25
+                elif rel == "direct":
+                    s *= 1.3
+                elif rel == "mention":
+                    s *= 1.1
                 kw_scores[atom.atom_id] = s
                 candidates[atom.atom_id] = atom
         except Exception as e:
@@ -1067,6 +1074,60 @@ class MemoryStore:
                 (now, now, max(0.1, float(refresh_ratio)), atom_id),
             )
             await db.commit()
+
+    # ---------- 睡眠强化 ----------
+
+    async def recent_created(self, days: float = 3.0, limit: int = 500) -> list[Atom]:
+        """近 N 天内新建的 active 原子（按创建时间）。"""
+        cutoff = time.time() - max(0.1, float(days)) * 86400
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "SELECT * FROM atoms WHERE status = ? AND create_time >= ? "
+                "ORDER BY create_time DESC LIMIT ?",
+                (AtomStatus.ACTIVE.value, cutoff, max(1, int(limit))),
+            )
+            rows = await cursor.fetchall()
+        return [self._row_to_atom(r) for r in rows]
+
+    async def boost_atom(self, atom_id: int, importance: float, attribution: str = "") -> bool:
+        """睡眠强化：上调重要性、reinforce+1、刷时间；可选写归因（self/other）。"""
+        now = time.time()
+        imp = round(max(0.0, min(0.95, float(importance))), 2)
+        try:
+            async with self._connect() as db:
+                if attribution:
+                    await db.execute(
+                        "UPDATE atoms SET importance = ?, reinforce_count = reinforce_count + 1, "
+                        "last_reinforce = ?, last_access = ?, "
+                        "metadata = json_set(COALESCE(metadata,'{}'), '$.attribution', ?) "
+                        "WHERE id = ?",
+                        (imp, now, now, str(attribution), atom_id),
+                    )
+                else:
+                    await db.execute(
+                        "UPDATE atoms SET importance = ?, reinforce_count = reinforce_count + 1, "
+                        "last_reinforce = ?, last_access = ? WHERE id = ?",
+                        (imp, now, now, atom_id),
+                    )
+                await db.commit()
+            return True
+        except Exception as e:
+            logger.warning(f"[human_like_mem] 强化原子失败: {e!r}")
+            return False
+
+    async def promote_to_hot(self, atom_id: int) -> bool:
+        """只刷 last_access（提进热区），不改寿命、不 reinforce。"""
+        try:
+            async with self._connect() as db:
+                await db.execute(
+                    "UPDATE atoms SET last_access = ? WHERE id = ?",
+                    (time.time(), atom_id),
+                )
+                await db.commit()
+            return True
+        except Exception as e:
+            logger.warning(f"[human_like_mem] 提热区失败: {e!r}")
+            return False
 
     # ---------- 统计 ----------
 

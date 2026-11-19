@@ -81,16 +81,33 @@ def find_data_dir() -> str | None:
             break
         cur = parent
 
-    # 常见位置（只是兜底，不保证存在）
+    # 常见位置（只是兜底，不保证存在）。不写死盘符：系统盘用 SystemDrive 拼。
     for guess in (
         os.path.expanduser("~/AstrBot/data"),
-        r"C:\AstrBot\data",
+        os.path.join(os.environ.get("SystemDrive", "C:") + os.sep, "AstrBot", "data"),
         "/opt/astrbot/data",
         "/AstrBot/data",
     ):
         if _looks_like_data_dir(guess):
             return os.path.abspath(guess)
     return None
+
+
+def default_owner_id() -> str:
+    """从 AstrBot 配置里的 admins_id 取第一个非 'astrbot' 的管理员，不硬编码主人号。"""
+    data_dir = find_data_dir()
+    if not data_dir:
+        return ""
+    cfg_path = os.path.join(data_dir, "cmd_config.json")
+    try:
+        cfg = json.load(open(cfg_path, encoding="utf-8"))
+        for a in (cfg.get("admins_id") or []):
+            a = str(a).strip()
+            if a and a != "astrbot":
+                return a
+    except Exception:
+        pass
+    return ""
 
 
 def default_dbs() -> tuple[str | None, str | None]:
