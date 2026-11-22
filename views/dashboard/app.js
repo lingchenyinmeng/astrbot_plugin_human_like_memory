@@ -418,6 +418,88 @@
     });
   }
 
+  /* ================= 火花（活化因子） ================= */
+  var aKindFilter = "";
+  async function loadActivations() {
+    var box = $("actList");
+    box.innerHTML = '<div class="empty">加载中…</div>';
+    try {
+      var d = await call("/activations");
+      var all = d.items || [];
+      $("cntAct").textContent = all.length;
+      var items = all.filter(function (x) { return !aKindFilter || x.kind === aKindFilter; });
+      if (!items.length) { box.innerHTML = '<div class="empty">还没有火花</div>'; return; }
+      box.innerHTML = items.map(function (a) {
+        return '<div class="card act-card">' +
+          '<div class="content">' + esc(a.content) + '</div>' +
+          '<div class="meta">' +
+            '<span class="tag">' + (a.kind === "hot" ? "热" : "冷") + '</span>' +
+            '<span class="tag">火花 ' + a.spark + '</span>' +
+            '<span class="tag">命中 ' + a.hit_count + ' 次</span>' +
+            '<span class="tag">重要性 ' + a.importance + '</span>' +
+            (a.note ? '<span class="tag">' + esc(a.note) + '</span>' : '') +
+            (a.last_hit_text !== "-" ? '<span class="tag time">上次 ' + esc(a.last_hit_text) + '</span>' : '') +
+          '</div></div>';
+      }).join("");
+    } catch (e) {
+      box.innerHTML = '<div class="empty">加载失败：' + esc(e.message) + '</div>';
+    }
+  }
+
+  /* ================= 设置 ================= */
+  var cfgData = null;
+  async function loadSettings() {
+    var grid = $("setGrid");
+    grid.innerHTML = '<div class="empty">加载中…</div>';
+    try {
+      var d = await call("/config");
+      var items = (d && d.items) || {};
+      cfgData = items;
+      var keys = Object.keys(items).sort();
+      grid.innerHTML = keys.map(function (k) {
+        var it = items[k];
+        var id = "cfg_" + k;
+        var label = '<span class="set-label">' + esc(it.label) +
+          (it.hint ? '<small>' + esc(it.hint) + '</small>' : '') + '</span>';
+        if (it.type === "bool") {
+          return '<label class="set-item">' + label +
+            '<input type="checkbox" id="' + id + '"' + (it.value ? " checked" : "") + '></label>';
+        }
+        if (it.type === "int" || it.type === "float") {
+          return '<label class="set-item">' + label +
+            '<input type="number" step="' + (it.type === "int" ? "1" : "any") +
+            '" id="' + id + '" value="' + it.value + '"></label>';
+        }
+        return '<label class="set-item">' + label +
+          '<input type="text" id="' + id + '" value="' + esc(String(it.value)) + '"></label>';
+      }).join("");
+    } catch (e) {
+      grid.innerHTML = '<div class="empty">加载失败：' + esc(e.message) + '</div>';
+    }
+  }
+
+  async function saveSettings() {
+    if (!cfgData) return;
+    var body = {};
+    Object.keys(cfgData).forEach(function (k) {
+      var el = $("cfg_" + k);
+      if (!el) return;
+      var it = cfgData[k];
+      if (it.type === "bool") body[k] = el.checked;
+      else if (it.type === "int") body[k] = parseInt(el.value, 10) || 0;
+      else if (it.type === "float") body[k] = parseFloat(el.value) || 0;
+      else body[k] = el.value;
+    });
+    $("saveHint").textContent = "保存中…";
+    try {
+      if (!api || !api.apiPost) throw new Error("桥接不支持 POST");
+      await api.apiPost(PREFIX + "/config", body);
+      $("saveHint").textContent = "已保存";
+    } catch (e) {
+      $("saveHint").textContent = "保存失败：" + e.message;
+    }
+  }
+
   /* ================= 通用 ================= */
 
   function each(list, fn) { Array.prototype.forEach.call(list, fn); }
@@ -450,10 +532,16 @@
     $("view-relations").hidden = name !== "relations";
     var qv = $("view-quality");
     if (qv) qv.hidden = name !== "quality";
+    var av = $("view-activations");
+    if (av) av.hidden = name !== "activations";
+    var sv = $("view-settings");
+    if (sv) sv.hidden = name !== "settings";
     if (name === "memories") loadMemories();
     if (name === "people") loadPeople();
     if (name === "relations") loadRelations();
     if (name === "quality") loadQuality();
+    if (name === "activations") loadActivations();
+    if (name === "settings") loadSettings();
   }
 
   function bind() {
@@ -477,6 +565,12 @@
     $("pStatus").addEventListener("change", function () { ppl.status = this.value; ppl.page = 1; loadPeople(); });
     $("closeBtn").addEventListener("click", function () { $("mask").classList.remove("show"); });
     $("mask").addEventListener("click", function (e) { if (e.target === $("mask")) $("mask").classList.remove("show"); });
+    var aK = $("aKind");
+    if (aK) aK.addEventListener("change", function () { aKindFilter = this.value; loadActivations(); });
+    var aR = $("aRefresh");
+    if (aR) aR.addEventListener("click", function () { loadActivations(); });
+    var sC = $("saveCfg");
+    if (sC) sC.addEventListener("click", function () { saveSettings(); });
     window.addEventListener("resize", function () {
       if (tab === "relations" && graphData.nodes.length) renderGraph();
     });
@@ -495,6 +589,7 @@
     }
     await loadStats();
     await loadMemories();
+    loadActivations();
   }
 
   if (document.readyState === "loading") {

@@ -232,5 +232,87 @@
     "hint": "没 @ 没名字的消息，让模型判一句「是不是在说她的事」。",
     "type": "bool",
     "default": true
+  },
+  "activation_enabled": {
+    "description": "启用活化因子",
+    "hint": "让记忆自己冒出来（热=聊天中想起，冷=空闲时主动想起）",
+    "type": "bool",
+    "default": true
+  },
+  "hot_activation_enabled": {
+    "description": "聊天中突然想起",
+    "hint": "聊天时按概率想起一条，自然带进回复",
+    "type": "bool",
+    "default": true
+  },
+  "cold_activation_enabled": {
+    "description": "空闲时主动想起",
+    "hint": "闲着时可能主动私聊，慎开",
+    "type": "bool",
+    "default": true
+  },
+  "activation_prob_factor": {
+    "description": "活化概率系数",
+    "hint": "整体乘这个数，1=原样，0.5=减半",
+    "type": "float",
+    "default": 1.0,
+    "slider": {
+      "min": 0,
+      "max": 2,
+      "step": 0.1
+    }
+  },
+  "cooldown_min_days": {
+    "description": "最短冷却（天）",
+    "hint": "最重要的记忆也至少隔这么久",
+    "type": "float",
+    "default": 0.5,
+    "slider": {
+      "min": 0.1,
+      "max": 5,
+      "step": 0.1
+    }
+  },
+  "cooldown_max_days": {
+    "description": "最长冷却（天）",
+    "hint": "重要性越低冷却越接近这个值",
+    "type": "float",
+    "default": 30.0,
+    "slider": {
+      "min": 1,
+      "max": 60,
+      "step": 1
+    }
+  },
+  "cold_idle_minutes": {
+    "description": "空闲多少分钟才想起",
+    "type": "int",
+    "default": 60
+  },
+  "cold_min_gap_hours": {
+    "description": "两次主动消息间隔（小时）",
+    "type": "float",
+    "default": 4.0
+  },
+  "cold_daily_cap": {
+    "description": "每天主动消息上限",
+    "type": "int",
+    "default": 3
+  },
+  "quiet_start_hour": {
+    "description": "免打扰开始（小时）",
+    "type": "int",
+    "default": 23
+  },
+  "quiet_end_hour": {
+    "description": "免打扰结束（小时）",
+    "type": "int",
+    "default": 8
+  },
+  "proactive_session": {
+    "description": "主动消息目标会话",
+    "hint": "留空自动用最近一次主人私聊",
+    "type": "string",
+    "default": ""
   }
 }

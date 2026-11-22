@@ -185,3 +185,35 @@ button { cursor: pointer; font-family: inherit; font-size: 13px; border-radius: 
 .q-bar { flex: 1; height: 8px; background: var(--panel2); border-radius: 4px; overflow: hidden; }
 .q-bar i { display: block; height: 100%; background: var(--accent); border-radius: 4px; }
 .q-bar-n { width: 42px; text-align: right; color: var(--muted); flex: none; }
+
+/* 活化因子（火花） */
+.act-list { display: flex; flex-direction: column; gap: 10px; }
+
+/* 设置 */
+.set-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 8px 16px;
+}
+.set-item {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; padding: 8px 12px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  font-size: 12px;
+}
+.set-label { display: flex; flex-direction: column; gap: 2px; color: var(--text); word-break: break-all; }
+.set-label small { color: var(--muted); font-size: 11px; }
+.set-item input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--accent); }
+.set-item input[type="number"],
+.set-item input[type="text"] {
+  width: 120px; padding: 5px 8px;
+  background: var(--panel2); color: var(--text);
+  border: 1px solid var(--line); border-radius: 6px; font-size: 12px;
+}
+.save-bar {
+  position: sticky; bottom: 0; display: flex; align-items: center; gap: 12px;
+  margin-top: 14px; padding: 10px 12px;
+  background: rgba(13,17,25,.92); border-top: 1px solid var(--line);
+  backdrop-filter: blur(6px);
+}
+#saveHint { font-size: 12px; color: var(--muted); }

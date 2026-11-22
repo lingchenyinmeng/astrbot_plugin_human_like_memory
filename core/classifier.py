@@ -12,15 +12,42 @@ from typing import Any
 from .models import Atom, AtomStatus, MType
 from .nature import apply_history, classify_nature, resolve_nature, to_tier
 
-# ---------- 关键词表 ----------
+# ---------- 关键词表（带权重 + 上下文约束）----------
+# 旧版是「一个词命中就定」，别/去/现在/喜欢/不行 这种日常高频词会把大量陈述带偏。
+# 现在改成打分制：词给分，上下文约束单独给分，取最高分；
+# 没有上下文支撑的通用词单独出现拿不到分，落到 fact。
 
-_CMD = r"去|帮我|给我|马上|现在|立刻|不许|不准|别|以后|每次|记得|要一直|改成|教|学会|要求|让我|叫我|喊我|吩咐|叮嘱"
-_PROMISE = r"答应|承诺|约定|说好|一定|我会|保证"
-_PRAISE = r"可爱|厉害|聪明|好看|不错|挺好|棒|优秀|喜欢|真行|靠谱|夸"
-_BLAME = r"蠢|笨|傻|烦|啰嗦|话多|点偏|错了|不行|没用|废物|滚|嫌|骂"
-_EMOTION = r"累|困|难过|开心|烦|委屈|生气|害怕|想哭|难受|高兴|崩溃|爽"
-_REQUEST = r"能不能|可不可以|帮我|请问|怎么办|要不要|吗[？?]?$|呢[？?]?$|为什么|是不是"
-_SMALLTALK = r"^哈|^嗯|^哦|^在吗|^早|^晚|吃了|睡了|天气|晚安"
+# (mtype, 权重, 正则)
+_TYPE_RULES: list[tuple[str, float, str]] = [
+    # 承诺：我答应/保证/说好 + 对象
+    ("promise", 1.0, r"(?:我|铃光|小光)[^。！？]{0,10}(?:答应|承诺|说好|保证|一定|会)(?:你|他|她|以后|要)"),
+    ("promise", 0.8, r"(?:答应你|答应过你|保证不|承诺过|说好不)"),
+    # 夸：对象得是铃光/你/她 + 夸词（不能只是「喜欢某物」）
+    ("praise", 1.0, r"(?:你|铃光|小光|她)[^。！？]{0,10}(?:真|太|挺|好|很|最)*(?:可爱|厉害|聪明|好看|棒|优秀|靠谱|乖|真好|真行)"),
+    ("praise", 0.7, r"(?:夸|表扬|称赞)(?:你|我|铃光|小光)"),
+    # 骂：对象得是人 + 骂词
+    ("blame", 1.0, r"(?:你|铃光|小光|她)[^。！？]{0,10}(?:蠢|笨|傻|废物|没用|垃圾|白痴|智障|啰嗦|烦人)"),
+    ("blame", 0.75, r"(?:凶你|凶我|骂你|骂我|凶她|骂她)"),
+    # 命令：祈使 / 第二人称规矩 / 让我 / 要求 / 教我
+    ("command", 1.0, r"(?:让我|要求我|吩咐我|叮嘱我|让我以后|要我)[^。！？]{0,50}"),
+    ("command", 0.85, r"(?:要求|规定|吩咐|叮嘱)[^。！？]{0,40}"),
+    ("command", 0.8, r"(?:教|指导)我[^。！？]{0,40}"),
+    ("command", 0.9, r"(?:你|铃光|小光)[^。！？]{0,8}(?:以后|每次|记住|别再|不许|不准|必须|要一直|从现在起)"),
+    ("command", 0.8, r"(?:以后|每次)[^。！？]{0,24}(?:别|不许|不准|别再|记得|要一直|必须)"),
+    ("command", 0.75, r"^(?:别|不许|不准|不要|去|赶紧|马上)[^。！？]{1,40}"),
+    ("command", 0.6, r"(?:记得|别忘了)(?:吃|睡|回|叫|说|带|买)"),
+    # 情绪：第一人称
+    ("emotion", 1.0, r"(?:^我|我有点|我好|我今天|我最近|今天|最近)[^。！？]{0,8}(?:累|困|难过|开心|烦|委屈|生气|害怕|崩溃|想哭|高兴|爽)"),
+    ("emotion", 0.6, r"(?:心累|烦死|气死|累死|开心死了|好难过)"),
+    # 提问（允许句末带引号/括号）
+    ("request", 1.0, r"[？?][」』）)\s]*$|(?:吗|呢)[。！!…」』）)\s]*$"),
+    ("request", 0.8, r"(?:怎么|为什么|是不是|能不能|可不可以|要不要|请问|怎么办|有没有|会不会|在哪|几点)"),
+    # 闲聊
+    ("smalltalk", 1.0, r"^(?:哈+|嗯+|哦+|在吗|早|晚安|早安|晚上好|吃了|睡了)[。！!…]*$"),
+    ("smalltalk", 0.5, r"(?:晚安|早安|道晚安|说睡了|睡了)"),
+]
+
+_TYPE_ORDER = ["promise", "blame", "praise", "command", "emotion", "request", "smalltalk"]
 
 # command 细分
 _RULE_WORDS = r"以后|每次|永远|不许|不准|别再|要一直|从现在起|记住|规矩|定个规矩"
@@ -39,27 +66,32 @@ def _has(pattern: str, text: str) -> bool:
 
 
 def classify_type(text: str) -> tuple[str, float]:
-    """判 type（什么性质的话）。"""
-    t = str(text or "")
-    if _has(_PROMISE, t):
-        return MType.PROMISE.value, 0.78
-    if _has(_PRAISE, t):
-        return MType.PRAISE.value, 0.75
-    if _has(_BLAME, t):
-        return MType.BLAME.value, 0.76
-    if _has(_CMD, t):
-        return MType.COMMAND.value, 0.74
-    if _has(_EMOTION, t):
-        return MType.EMOTION.value, 0.72
-    if _has(_REQUEST, t):
-        return MType.REQUEST.value, 0.70
-    if _has(_SMALLTALK, t):
-        return MType.SMALLTALK.value, 0.65
-    return MType.FACT.value, 0.60
+    """判 type（什么性质的话）。打分制：命中越多越强分越高；通用词单点出现不给分。"""
+    t = str(text or "").strip()
+    if not t:
+        return MType.FACT.value, 0.5
+    scores: dict[str, float] = {}
+    for mtype, weight, pattern in _TYPE_RULES:
+        if _has(pattern, t):
+            scores[mtype] = scores.get(mtype, 0.0) + weight
+    if not scores:
+        return MType.FACT.value, 0.60
+    best = sorted(
+        scores.items(),
+        key=lambda kv: (
+            -kv[1],
+            _TYPE_ORDER.index(kv[0]) if kv[0] in _TYPE_ORDER else 99,
+        ),
+    )[0]
+    mtype, score = best
+    conf = min(0.95, 0.55 + 0.12 * score)
+    return mtype, round(conf, 2)
 
 
-def classify_subtype(mtype: str, text: str) -> str:
-    """只给 command / fact / blame 三种细分。"""
+def classify_subtype(mtype: str, text: str, *, layer: str = "") -> str:
+    """细分。command: rule/action/teaching；blame: identity/behavior；
+    fact: trait/relation/state/knowledge/event。
+    """
     t = str(text or "")
     if mtype == MType.COMMAND.value:
         if _has(_RULE_WORDS, t):
@@ -70,9 +102,18 @@ def classify_subtype(mtype: str, text: str) -> str:
     if mtype == MType.BLAME.value:
         return "identity" if _has(_IDENTITY_WORDS, t) else "behavior"
     if mtype == MType.FACT.value:
-        # 有人称 + 描述 → person；纯事件 → event
-        if _has(r"是|叫|喜欢|住在|年龄|生日|职业|工作", t) and _has(r"[一-龥]{2,4}", t):
-            return "person"
+        # 属性：句首像人名 + 属性词（"鲸宝喜欢…"「噩壤的生日是…」）
+        if _has(r"^(?:[一-龥A-Za-z0-9_~ ]{2,12})(?:是|叫|喜欢|讨厌|擅长|生日|年龄|职业|住|外号)", t):
+            return "trait"
+        # 关系：谁和谁
+        if _has(r"(?:和|跟|与)[^。！？]{0,10}(?:在一起|分手|吵架|闹翻|和好|是朋友|是对象|恋人|夫妻|暧昧)", t):
+            return "relation"
+        # 知识/规则
+        if _has(r"(?:意思|解释|定义|叫做|指的是|规则|原理|用法|名词)", t):
+            return "knowledge"
+        # 状态：在干嘛、进度
+        if _has(r"(?:正在|还在|目前|最近|准备|打算|要去|已经|进度|在忙)", t):
+            return "state"
         return "event"
     return ""
 
@@ -204,20 +245,63 @@ IMPORTANCE_BASE: dict[str, float] = {
 }
 
 
-def importance_for(mtype: str, llm_value) -> float:
-    """算重要性：类型基线为主，LLM 给的值只做微调。
+# 子类型对重要性的微调：关系 > 属性 > 知识 > 事件 > 状态
+_SUBTYPE_IMPORTANCE: dict[str, float] = {
+    "rule": 0.05,
+    "teaching": 0.03,
+    "action": 0.0,
+    "trait": 0.05,
+    "relation": 0.08,
+    "state": -0.05,
+    "knowledge": 0.03,
+    "event": -0.03,
+    "identity": 0.03,
+    "behavior": 0.0,
+}
 
-    LLM 经常返回 0.3 这种兜底值（占全库 42%），不能让它主导。
-    策略：LLM 值 ≤ 0.35 视为「没给」，直接用基线；否则取基线和它的平均。
+
+def importance_for(
+    mtype: str,
+    llm_value,
+    *,
+    text: str = "",
+    layer: str = "",
+    subtype: str = "",
+) -> float:
+    """算重要性：类型基线 + 子类型微调 + 上下文加减，LLM 值只做微调。
+
+    旧版「基线 + LLM 平均」把差异抹平，全库 78% 挤在 0.4–0.6。
+    现在按「涉不涉及她/主人、语气强不强、信息量、子类型」加减，拉开区分度。
     """
     base = IMPORTANCE_BASE.get(str(mtype or ""), 0.5)
+    base += _SUBTYPE_IMPORTANCE.get(str(subtype or ""), 0.0)
+    score = base
+    t = str(text or "")
+    # 涉及铃光 / 主人 → 更重
+    if re.search(r"(?:铃光|小光|主人|噩壤|你)", t):
+        score += 0.06
+    # 强语气 → 更重
+    if re.search(r"[!！]{2,}|(?:太|真的|一定|必须|记住|千万)", t):
+        score += 0.05
+    # 主人直接对她说 / 她对主人说 → 更重
+    if layer in ("owner_to_me", "me_to_owner"):
+        score += 0.04
+    # 信息量：长句更重，超短句更轻
+    L = len(t)
+    if L >= 40:
+        score += 0.04
+    elif L <= 10:
+        score -= 0.04
+    if mtype == "smalltalk" or L <= 6:
+        score -= 0.06
+    # LLM 值只微调（≤0.35 视为没给）
     try:
         v = float(llm_value or 0)
     except (TypeError, ValueError):
-        return base
-    if v <= 0.35:
-        return base
-    return round((base + min(1.0, v)) / 2, 2)
+        v = 0.0
+    if v > 0.35:
+        score = score * 0.7 + min(1.0, v) * 0.3
+    return round(max(0.1, min(1.0, score)), 2)
 
 
 # 证据分层判定：这条记忆是「怎么知道的」。
@@ -237,19 +321,27 @@ def classify_evidence(
     owner_id: str = "",
     source: str = "",
 ) -> str:
-    """判这条记忆是亲历/查到/听说/推测/想象。
+    """判这条记忆是怎么知道的：亲历 / 查到 / 听说 / 旁听 / 转述 / 推测 / 想象。
 
-    顺序很重要：先排除「想象/推测」，再认「查到」，最后按说话人定亲历/听说。
-    因为「他可能知道」这种句子既像听说又像推测，推测更准确。
+    顺序很重要：先排除「想象/推测/查到」（语气词最准），再按 layer 定来源。
+    以前只要不是她自己说的就一律「听说」，90% 的库里全是「听说」，
+    这一档等于废了——现在把「旁听」（群里别人之间）和「转述」（A 说 B 说）
+    拆出来，权重才降得动。
     """
     t = str(text or "")
     for name, pat in _EVIDENCE_PATTERNS:
         if re.search(pat, t):
             return name
-    # 她自己做的事 → 亲历。注意：主人说的事也是「她听来的」，
-    # 不能因为 who 是主人就算亲历——那是把别人的话记成自己的经历。
+    # 她自己做的/说的 → 亲历
     if str(layer or "").startswith("me_"):
         return "亲历"
+    # 转述：A 说 B 说…（两层转述）
+    if re.search(r"(?:说|问|提到|讲|转述)[^。！？]{0,12}(?:说|问|提到|讲)", t):
+        return "转述"
+    # 群里别人之间在聊 → 旁听
+    if str(layer or "") == "other_to_other":
+        return "旁听"
+    # 别人直接对她说 → 听说
     return "听说"
 
 
@@ -343,12 +435,12 @@ def build_atoms(
         f_who_id, f_who_name = str(fw[0] or ""), str(fw[1] or "")
 
         mtype, tconf = classify_type(fact)
-        subtype = classify_subtype(mtype, fact)
         layer = classify_layer(
             fact, owner_id=owner_id, owner_name=owner_name, who_id=f_who_id,
             who_name=f_who_name, source=source, identities=identities,
             bot_names=bot_names,
         )
+        subtype = classify_subtype(mtype, fact, layer=layer)
 
         # 定性：按 mtype 定基调，正则只细化语气（避免两套规则打架）
         raw_nature, raw_conf, raw_reason, raw_evidence = resolve_nature(mtype, fact)
@@ -393,7 +485,7 @@ def build_atoms(
             arousal=_affect[1],
             privacy=privacy,
             status=AtomStatus.CANDIDATE.value,
-            importance=importance_for(mtype, importance),
+            importance=importance_for(mtype, importance, text=fact, layer=layer, subtype=subtype),
             create_time=now,
             last_access=now,
             session_id=session_id,

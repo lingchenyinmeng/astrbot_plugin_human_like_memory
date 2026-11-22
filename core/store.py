@@ -281,6 +281,23 @@ class MemoryStore:
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_nathist_atom ON atom_nature_history(atom_id)"
             )
+            # 活化因子：记忆会自己冒出来（hot=聊天中想起，cold=空闲时想起）
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS activations (
+                    atom_id INTEGER PRIMARY KEY,
+                    kind TEXT DEFAULT 'hot',
+                    spark REAL DEFAULT 0.5,
+                    hit_count INTEGER DEFAULT 0,
+                    last_hit_at REAL DEFAULT 0,
+                    followup INTEGER DEFAULT 0,
+                    target TEXT DEFAULT '',
+                    note TEXT DEFAULT '',
+                    enabled INTEGER DEFAULT 1,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_mem_time ON memories(create_time)"
             )
@@ -1200,6 +1217,86 @@ class MemoryStore:
             persona_id=str(g("persona_id") or ""),
             metadata=meta if isinstance(meta, dict) else {},
         )
+
+    # ---------- 活化因子（记忆自己冒出来） ----------
+
+    async def seed_activation(
+        self,
+        atom_id: int,
+        *,
+        kind: str,
+        spark: float,
+        followup: int = 0,
+        target: str = "",
+        note: str = "",
+    ) -> None:
+        """给一条原子挂活化种子（已存在就跳过）。"""
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO activations "
+                "(atom_id, kind, spark, hit_count, last_hit_at, followup, target, note, enabled, created_at) "
+                "VALUES (?, ?, ?, 0, 0, ?, ?, ?, 1, ?)",
+                (
+                    int(atom_id),
+                    str(kind or "hot"),
+                    float(spark or 0),
+                    int(followup or 0),
+                    str(target or ""),
+                    str(note or ""),
+                    time.time(),
+                ),
+            )
+            await db.commit()
+
+    async def get_activation(self, atom_id: int) -> dict | None:
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT * FROM activations WHERE atom_id=?", (int(atom_id),)
+            )
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def list_activations(self, *, kind: str = "", limit: int = 200) -> list[dict]:
+        async with self._connect() as db:
+            if kind:
+                cur = await db.execute(
+                    "SELECT a.*, t.content, t.importance FROM activations a "
+                    "JOIN atoms t ON t.id = a.atom_id "
+                    "WHERE a.enabled=1 AND a.kind=? ORDER BY a.spark DESC LIMIT ?",
+                    (str(kind), int(limit)),
+                )
+            else:
+                cur = await db.execute(
+                    "SELECT a.*, t.content, t.importance FROM activations a "
+                    "JOIN atoms t ON t.id = a.atom_id "
+                    "WHERE a.enabled=1 ORDER BY a.spark DESC LIMIT ?",
+                    (int(limit),),
+                )
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def record_hit(self, atom_id: int, *, decay: float = 0.7) -> None:
+        """记一次命中：命中次数 +1、时间刷新、spark 衰减。"""
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE activations SET hit_count = hit_count + 1, "
+                "last_hit_at = ?, spark = MAX(0.02, spark * ?) WHERE atom_id = ?",
+                (time.time(), float(decay), int(atom_id)),
+            )
+            await db.commit()
+
+    async def set_activation_enabled(self, atom_id: int, enabled: bool) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE activations SET enabled=? WHERE atom_id=?",
+                (1 if enabled else 0, int(atom_id)),
+            )
+            await db.commit()
+
+    async def delete_activation(self, atom_id: int) -> None:
+        async with self._connect() as db:
+            await db.execute("DELETE FROM activations WHERE atom_id=?", (int(atom_id),))
+            await db.commit()
 
 
 __all__ = ["MemoryStore"]

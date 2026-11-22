@@ -60,14 +60,18 @@ class MType(str, Enum):
 
 
 class SubType(str, Enum):
-    """子类型（只有三种 type 有）。"""
+    """子类型（只有几种 type 有）。"""
 
     RULE = "rule"          # command: 长期规矩
     ACTION = "action"      # command: 一次性任务
     TEACHING = "teaching"  # command: 教导
-    PERSON = "person"      # fact: 人物事实
+    PERSON = "person"      # fact: 人物事实（旧，保留兼容）
     EVENT = "event"        # fact: 事件经过
     OBSERVE = "observe"    # fact: 群聊旁观
+    TRAIT = "trait"        # fact: 某人的属性（性格、喜好、能力）
+    RELATION = "relation"  # fact: 谁和谁的关系
+    STATE = "state"        # fact: 当前状态（在干嘛、心情、进度）
+    KNOWLEDGE = "knowledge"  # fact: 知识、规则、名词解释
     BEHAVIOR = "behavior"  # blame: 行为批评
     IDENTITY = "identity"  # blame: 人格否定
 
@@ -97,6 +101,20 @@ BASE_TTL: dict[str, float] = {
     "preference": 60,
     "planned": 2,
     "unknown": 30,
+}
+
+# 话语类型 → 基准存活天数。
+# 以前 compute_ttl 拿 mtype（fact/command…）去查 BASE_TTL（episodic/factual…），
+# 键永远对不上，所有记忆一律落 30 天。这里修掉。
+MTYPE_TTL: dict[str, float] = {
+    "command": 90,   # 规矩/要求：得长期记着
+    "promise": 60,   # 答应的事
+    "praise": 30,    # 夸一句
+    "blame": 45,     # 批评：得知道哪里错了
+    "fact": 120,     # 事实/事件
+    "emotion": 20,   # 情绪：短
+    "request": 15,   # 提问
+    "smalltalk": 7,  # 闲聊
 }
 
 
@@ -189,7 +207,7 @@ class Atom:
 
     def compute_ttl(self) -> float:
         """按类型算存活天数。"""
-        base = BASE_TTL.get(self.mtype or "unknown", 30)
+        base = MTYPE_TTL.get(self.mtype or "", BASE_TTL.get("unknown", 30))
         imp_factor = 0.5 + max(0.0, min(1.0, self.importance))
         reinforce_factor = 1.0 + min(0.5, self.reinforce_count * 0.1)
         # 证据越弱，活得越短——「我猜的」不该跟「亲历的」一样久
@@ -200,16 +218,20 @@ class Atom:
 # 证据分层：这条记忆是「怎么知道的」。
 # 借鉴 Qingyi 的思路——亲历/听说/查到/推测/想象 永远不混写成事实。
 # 人格归纳时按这里的权重降权，避免把猜的当成真的。
-EVIDENCE_TYPES = ("亲历", "查到", "听说", "推测", "想象")
+EVIDENCE_TYPES = ("亲历", "查到", "听说", "旁听", "转述", "推测", "想象")
 EVIDENCE_WEIGHT = {
     "亲历": 1.0,   # 她自己做的/看到的
     "查到": 0.8,   # 翻文件、查日志、搜出来的
-    "听说": 0.7,   # 别人说的
+    "听说": 0.7,   # 别人直接对她说的
+    "旁听": 0.5,   # 群里别人之间在说，她在旁边听到的
+    "转述": 0.45,  # 别人转述第三个人的话（A 说 B 说…）
     "推测": 0.4,   # 她自己猜的
     "想象": 0.2,   # 假设、假如、梦
 }
-EVIDENCE_CN = {"亲历": "亲历", "查到": "查到", "听说": "听说",
-               "推测": "推测", "想象": "想象"}
+EVIDENCE_CN = {
+    "亲历": "亲历", "查到": "查到", "听说": "听说", "旁听": "旁听",
+    "转述": "转述", "推测": "推测", "想象": "想象",
+}
 
 
 def evidence_weight(kind: str) -> float:

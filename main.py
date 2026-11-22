@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import re
 import time
 
@@ -28,6 +29,7 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.config.astrbot_config import AstrBotConfig
 
+from .core import activation
 from .core.classifier import build_atoms, extract_context, infer_fact_speaker
 from .core.conversation import ConversationStore
 from .core.injector import Injector
@@ -63,6 +65,11 @@ class LingguangMemory(Star):
         self._wake_count = 0
         self._wake_window_start = 0.0
         self._sleep_task: asyncio.Task | None = None
+        # 活化因子：活跃时间 / 主动消息节流
+        self._last_activity_ts = time.time()
+        self._last_proactive_ts = 0.0
+        self._proactive_count = 0
+        self._last_proactive_day = ""
 
     # ---------- 配置 ----------
 
@@ -277,6 +284,11 @@ class LingguangMemory(Star):
             await self._maybe_sleep()
         except Exception as e:
             logger.debug(f"[human_like_mem] 睡眠强化触发失败: {e!r}")
+        # 6. 冷活化：空闲时突然想起一件事，可能主动发消息
+        try:
+            await self._cold_sparks()
+        except Exception as e:
+            logger.debug(f"[human_like_mem] 冷活化失败: {e!r}")
 
     async def _self_review(self) -> None:
         """自主整理记忆：偶尔把最近动过的记忆翻出来想一遍，感想写进 thoughts.jsonl。
@@ -533,6 +545,191 @@ class LingguangMemory(Star):
             self._wake_count = 0
             logger.info("[human_like_mem] 主人连续 %d 条，强制唤醒" % threshold)
 
+    # ---------- 活化因子：记忆自己冒出来 ----------
+
+    async def _seed_activations(self, atoms: list[Atom]) -> None:
+        """新建记忆时，把「揪着心」的那几条挂上火花。"""
+        if self.store is None or not bool(self.conf.get("activation_enabled", True)):
+            return
+        for a in atoms or []:
+            aid = int(getattr(a, "atom_id", 0) or 0)
+            if not aid:
+                continue
+            seed = activation.seed_for(str(a.content or ""))
+            if not seed:
+                continue
+            try:
+                await self.store.seed_activation(
+                    aid,
+                    kind=seed["kind"],
+                    spark=seed["spark"],
+                    followup=seed["followup"],
+                    note=seed["note"],
+                )
+            except Exception as e:
+                logger.debug(f"[human_like_mem] 挂火花失败: {e!r}")
+
+    def _activation_params(self) -> dict:
+        return {
+            "cd_min": float(self.conf.get("cooldown_min_days", 0.5) or 0.5),
+            "cd_max": float(self.conf.get("cooldown_max_days", 30.0) or 30.0),
+            "prob": max(
+                0.0,
+                min(1.0, float(self.conf.get("activation_prob_factor", 1.0) or 1.0)),
+            ),
+        }
+
+    async def _hot_spark(self, event: AstrMessageEvent) -> str:
+        """聊天中突然想起一条：返回要注入的提示词片段（空串 = 没想起）。"""
+        if self.store is None:
+            return ""
+        if not bool(self.conf.get("activation_enabled", True)):
+            return ""
+        if not bool(self.conf.get("hot_activation_enabled", True)):
+            return ""
+        p_cfg = self._activation_params()
+        try:
+            rows = await self.store.list_activations(kind="hot", limit=60)
+        except Exception as e:
+            logger.debug(f"[human_like_mem] 取热活化失败: {e!r}")
+            return ""
+        for r in rows:
+            imp = float(r.get("importance") or 0.5)
+            cd = activation.cooldown_days(imp, cd_min=p_cfg["cd_min"], cd_max=p_cfg["cd_max"])
+            p = (
+                activation.hit_probability(
+                    float(r.get("spark") or 0.0),
+                    hit_count=int(r.get("hit_count") or 0),
+                    last_hit_at=float(r.get("last_hit_at") or 0.0),
+                    cd_days=cd,
+                )
+                * p_cfg["prob"]
+            )
+            if p <= 0 or random.random() >= p:
+                continue
+            try:
+                await self.store.record_hit(int(r["atom_id"]))
+            except Exception:
+                pass
+            note = str(r.get("note") or "").strip()
+            tail = f"（{note}）" if note else ""
+            return (
+                "[你此刻突然想起]\n"
+                f"{str(r.get('content') or '')[:120]}{tail}\n"
+                "想起就自然带一句，别硬提；不想提就略过，别解释为什么想起。"
+            )
+        return ""
+
+    async def _cold_sparks(self) -> None:
+        """空闲时突然想起一条，可能主动发条消息。"""
+        if self.store is None:
+            return
+        if not bool(self.conf.get("activation_enabled", True)):
+            return
+        if not bool(self.conf.get("cold_activation_enabled", True)):
+            return
+        cfg = self._activation_params()
+        now = time.time()
+        # 免打扰时段
+        hour = time.localtime().tm_hour
+        qs = int(self.conf.get("quiet_start_hour", 23) or 23)
+        qe = int(self.conf.get("quiet_end_hour", 8) or 8)
+        in_quiet = (hour >= qs or hour < qe) if qs > qe else (qs <= hour < qe)
+        if in_quiet:
+            return
+        # 空闲门槛
+        idle_min = float(self.conf.get("cold_idle_minutes", 60) or 60)
+        if now - self._last_activity_ts < idle_min * 60:
+            return
+        # 两次主动消息间隔
+        gap_h = float(self.conf.get("cold_min_gap_hours", 4) or 4)
+        if now - self._last_proactive_ts < gap_h * 3600:
+            return
+        # 每日上限
+        today = time.strftime("%Y-%m-%d")
+        if self._last_proactive_day != today:
+            self._last_proactive_day = today
+            self._proactive_count = 0
+        if self._proactive_count >= int(self.conf.get("cold_daily_cap", 3) or 3):
+            return
+        try:
+            rows = await self.store.list_activations(kind="cold", limit=60)
+        except Exception as e:
+            logger.debug(f"[human_like_mem] 取冷活化失败: {e!r}")
+            return
+        for r in rows:
+            imp = float(r.get("importance") or 0.5)
+            cd = activation.cooldown_days(imp, cd_min=cfg["cd_min"], cd_max=cfg["cd_max"])
+            p = (
+                activation.hit_probability(
+                    float(r.get("spark") or 0.0),
+                    hit_count=int(r.get("hit_count") or 0),
+                    last_hit_at=float(r.get("last_hit_at") or 0.0),
+                    cd_days=cd,
+                )
+                * cfg["prob"]
+            )
+            if p <= 0 or random.random() >= p:
+                continue
+            await self._proactive_think(r)
+            return
+
+    async def _proactive_think(self, act: dict) -> None:
+        """突然想起一件事 → 让她想一下，愿意的话主动发一句。"""
+        session = self._owner_private_session()
+        if not session:
+            logger.debug("[human_like_mem] 没有主人私聊 session，跳过主动消息")
+            return
+        content = str(act.get("content") or "").strip()
+        note = str(act.get("note") or "").strip()
+        if not content:
+            return
+        prompt = (
+            f"你此刻闲着，突然想起一件事：{content}"
+            + (f"（{note}）" if note else "")
+            + "\n\n要不要主动找主人说一句？自然点，像随口提起，不超过 40 个字；"
+            "不想说就只回 SKIP。"
+        )
+        text = ""
+        bot_name = str(self.conf.get("bot_name") or "我").strip() or "我"
+        try:
+            provider = self.context.get_using_provider()
+            if provider is not None:
+                resp = await provider.text_chat(
+                    prompt=prompt,
+                    system_prompt=f"你是{bot_name}。你突然想起一件事，决定要不要主动跟主人说。",
+                    contexts=[],
+                )
+                text = str(getattr(resp, "completion_text", "") or "").strip()
+        except Exception as e:
+            logger.warning(f"[human_like_mem] 主动想起生成失败: {e!r}")
+            return
+        try:
+            await self.store.record_hit(int(act["atom_id"]))
+        except Exception:
+            pass
+        if not text or text.upper().startswith("SKIP") or len(text) > 120:
+            logger.info(f"[human_like_mem] 想起但没开口: {content[:30]}")
+            return
+        try:
+            await self.context.send_message(session, MessageChain().message(text))
+            self._last_proactive_ts = time.time()
+            self._proactive_count += 1
+            logger.info(f"[human_like_mem] 主动想起并开口: {text[:40]}")
+        except Exception as e:
+            logger.warning(f"[human_like_mem] 主动消息发送失败: {e!r}")
+
+    def _owner_private_session(self) -> str:
+        """拿主人的私聊 session（配置优先，否则用最近一次主人私聊的）。"""
+        fixed = str(self.conf.get("proactive_session", "") or "").strip()
+        if fixed:
+            return fixed
+        return str(getattr(self, "_owner_session", "") or "")
+
+    def _bot_display_name(self) -> str:
+        """记录「谁改的」用的显示名，配置里没写就用中性词，不硬编码。"""
+        return str(self.conf.get("bot_name") or "").strip() or "系统"
+
     async def _maybe_sleep(self) -> None:
         """到睡眠窗口、今晚没睡过 → 后台跑一次睡眠整理。"""
         if not bool(self.conf.get("sleep_enabled", True)):
@@ -772,6 +969,7 @@ class LingguangMemory(Star):
     async def _capture(self, event: AstrMessageEvent):
         """把每条消息先存下来（不拦、不改）。"""
         self._note_wake(event)
+        self._last_activity_ts = time.time()
         if self.conv is None:
             return
         try:
@@ -779,6 +977,15 @@ class LingguangMemory(Star):
             content = str(getattr(event, "message_str", "") or "").strip()
             if not session_id or not content:
                 return
+            # 记住主人的私聊 session，主动消息要用
+            try:
+                if (
+                    "FriendMessage" in session_id
+                    and str(event.get_sender_id() or "") == self.owner_id
+                ):
+                    self._owner_session = session_id
+            except Exception:
+                pass
             await self.conv.add_message(
                 session_id,
                 content,
@@ -866,6 +1073,8 @@ class LingguangMemory(Star):
                 # 挂 person_id：一条事件可能同时牵扯好几个人
                 await self._attach_person_ids(atom_objs, mem.participant_identities)
                 await self.store.add_atoms(atom_objs)
+                # 活化因子：给「揪着心」的那几条挂火花（记忆中自己冒出来）
+                await self._seed_activations(atom_objs)
             await self.conv.mark_summarized(session_id, int(msgs[-1]["id"]))
             logger.info(
                 f"[human_like_mem] {session_id} 总结完成: "
@@ -891,7 +1100,7 @@ class LingguangMemory(Star):
         # 按 fact 开头的名字推断是谁说的，不再整段都算第一个人说的。
         name_map: dict[str, tuple[str, str]] = {}
         bot_id = ""
-        bot_name = str(self.conf.get("bot_name") or "").strip() or "铃光"
+        bot_name = str(self.conf.get("bot_name") or "").strip() or "我"
         for ident in mem.participant_identities or []:
             sid = str(ident.get("sender_id") or "").strip()
             nm = str(ident.get("display_name") or "").strip()
@@ -1223,7 +1432,7 @@ class LingguangMemory(Star):
             res = await self.people.set_tone(
                 ME_ID, pid, new_tone,
                 reason=str(obj.get("reason") or "")[:150],
-                changed_by="铃光",
+                changed_by=self._bot_display_name(),
             )
             if res.get("changed"):
                 logger.info(
@@ -1533,6 +1742,13 @@ class LingguangMemory(Star):
                     text = (text + "\n" + cue_text) if text else cue_text
             except Exception as e:
                 logger.debug(f"[human_like_mem] 线索注入失败: {e!r}")
+            # 活化因子：聊天中突然想起一件事
+            try:
+                spark_text = await self._hot_spark(event)
+                if spark_text:
+                    text = (text + "\n" + spark_text) if text else spark_text
+            except Exception as e:
+                logger.debug(f"[human_like_mem] 热活化失败: {e!r}")
             if text:
                 # TextPart 在 astrbot.core.agent.message，不在 core.message.components
                 from astrbot.core.agent.message import TextPart
@@ -1847,7 +2063,7 @@ class LingguangMemory(Star):
 
                     await self.people.set_tone(
                         ME_ID, b_id, str(tone), rel_type=rt,
-                        reason=str(note or ""), changed_by="铃光",
+                        reason=str(note or ""), changed_by=self._bot_display_name(),
                     )
                 except Exception as e:
                     logger.debug(f"[human_like_mem] 记底色失败: {e!r}")

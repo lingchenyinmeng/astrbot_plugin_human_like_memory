@@ -67,6 +67,10 @@ SUBTYPE_CN = {
     "person": "人物",
     "event": "事件",
     "observe": "旁观",
+    "trait": "属性",
+    "relation": "关系",
+    "state": "状态",
+    "knowledge": "知识",
     "behavior": "行为批评",
     "identity": "人格否定",
 }
@@ -144,6 +148,10 @@ class PageApi:
         register(f"{PAGE_API_PREFIX}/relations", self.list_relations, ["GET"], "HLM relations")
         register(f"{PAGE_API_PREFIX}/graph", self.get_graph, ["GET"], "HLM relation graph")
         register(f"{PAGE_API_PREFIX}/quality", self.get_quality, ["GET"], "HLM data quality")
+        register(f"{PAGE_API_PREFIX}/config", self.get_config, ["GET"], "HLM config")
+        register(f"{PAGE_API_PREFIX}/config", self.save_config, ["POST"], "HLM config save")
+        register(f"{PAGE_API_PREFIX}/activations", self.list_activations, ["GET"], "HLM activations")
+        register(f"{PAGE_API_PREFIX}/activation", self.set_activation, ["POST"], "HLM activation")
 
     # ---------- 接口 ----------
 
@@ -561,6 +569,114 @@ class PageApi:
             return json_response({"status": "ok", "data": out})
         except Exception as e:
             logger.warning(f"[human_like_mem] 面板质量接口失败: {e!r}")
+            return json_response({"status": "error", "message": str(e)[:200]}, status_code=500)
+
+
+    # ---------- 配置 / 活化因子 ----------
+
+    async def get_config(self):
+        conf = getattr(self.plugin, "conf", None)
+        if conf is None:
+            return json_response({"status": "error", "message": "插件还没初始化"}, status_code=503)
+        # 读 schema 拿中文说明，面板上就显示中文而不是英文键
+        schema: dict = {}
+        try:
+            import os as _os
+
+            p = _os.path.join(
+                _os.path.dirname(_os.path.dirname(__file__)), "_conf_schema.json"
+            )
+            with open(p, encoding="utf-8") as f:
+                schema = json.load(f)
+        except Exception as e:
+            logger.debug(f"[human_like_mem] 读配置 schema 失败: {e!r}")
+        items = {}
+        for k, v in dict(conf).items():
+            meta = schema.get(k) or {}
+            t = str(meta.get("type") or "")
+            if not t:
+                t = (
+                    "bool"
+                    if isinstance(v, bool)
+                    else ("int" if isinstance(v, int) else ("float" if isinstance(v, float) else "string"))
+                )
+            items[k] = {
+                "value": v,
+                "label": str(meta.get("description") or k),
+                "hint": str(meta.get("hint") or ""),
+                "type": t,
+            }
+        return json_response({"status": "ok", "data": {"items": items}})
+
+    async def save_config(self):
+        body = await request.json({}) or {}
+        conf = getattr(self.plugin, "conf", None)
+        if conf is None:
+            return json_response({"status": "error", "message": "插件还没初始化"}, status_code=503)
+        changed = 0
+        for k, v in body.items():
+            if k in conf:
+                conf[k] = v
+                changed += 1
+        try:
+            conf.save_config()
+        except Exception as e:
+            logger.warning(f"[human_like_mem] 保存配置失败: {e!r}")
+            return json_response({"status": "error", "message": str(e)[:200]}, status_code=500)
+        return json_response({"status": "ok", "data": {"changed": changed}})
+
+    async def list_activations(self):
+        store = getattr(self.plugin, "store", None)
+        if store is None:
+            return json_response({"status": "error", "message": "插件还没初始化"}, status_code=503)
+        try:
+            rows = await store.list_activations(limit=300)
+            items = []
+            for r in rows:
+                last_hit = float(r.get("last_hit_at") or 0)
+                items.append(
+                    {
+                        "atom_id": int(r.get("atom_id") or 0),
+                        "kind": r.get("kind") or "",
+                        "spark": round(float(r.get("spark") or 0), 2),
+                        "hit_count": int(r.get("hit_count") or 0),
+                        "last_hit_text": (
+                            time.strftime("%Y-%m-%d %H:%M", time.localtime(last_hit))
+                            if last_hit
+                            else "-"
+                        ),
+                        "followup": bool(r.get("followup")),
+                        "note": r.get("note") or "",
+                        "content": r.get("content") or "",
+                        "importance": round(float(r.get("importance") or 0), 2),
+                    }
+                )
+            return json_response(
+                {"status": "ok", "data": {"items": items, "total": len(items)}}
+            )
+        except Exception as e:
+            logger.warning(f"[human_like_mem] 面板活化失败: {e!r}")
+            return json_response({"status": "error", "message": str(e)[:200]}, status_code=500)
+
+    async def set_activation(self):
+        store = getattr(self.plugin, "store", None)
+        if store is None:
+            return json_response({"status": "error", "message": "插件还没初始化"}, status_code=503)
+        body = await request.json({}) or {}
+        try:
+            aid = int(body.get("atom_id") or 0)
+        except (TypeError, ValueError):
+            aid = 0
+        if not aid:
+            return json_response({"status": "error", "message": "缺少 atom_id"}, status_code=400)
+        try:
+            if bool(body.get("delete")):
+                await store.delete_activation(aid)
+            else:
+                await store.set_activation_enabled(aid, bool(body.get("enabled", True)))
+            return json_response({"status": "ok"})
+        except Exception as e:
+            logger.warning(f"[human_like_mem] 改活化失败: {e!r}")
             return json_response({"status": "error", "message": str(e)[:200]}, status_code=500)
 
 

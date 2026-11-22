@@ -34,7 +34,9 @@
       <button data-tab="memories" class="on">记忆 <em id="cntMem">0</em></button>
       <button data-tab="people">人物 <em id="cntPpl">0</em></button>
       <button data-tab="relations">关系 <em id="cntRel">0</em></button>
+      <button data-tab="activations">火花 <em id="cntAct">0</em></button>
       <button data-tab="quality">质量</button>
+      <button data-tab="settings">设置</button>
     </nav>
 
     <!-- 记忆 -->
@@ -107,6 +109,28 @@
           <h3>类型分布</h3>
           <div id="qMtype"></div>
         </div>
+      </div>
+    </section>
+
+    <!-- 火花（活化因子） -->
+    <section class="view" id="view-activations" hidden>
+      <div class="filters">
+        <select id="aKind">
+          <option value="">全部</option>
+          <option value="hot">热（聊天中想起）</option>
+          <option value="cold">冷（空闲时想起）</option>
+        </select>
+        <button class="primary" id="aRefresh">刷新</button>
+      </div>
+      <div class="act-list" id="actList"></div>
+    </section>
+
+    <!-- 设置 -->
+    <section class="view" id="view-settings" hidden>
+      <div class="set-grid" id="setGrid"></div>
+      <div class="save-bar">
+        <button class="primary" id="saveCfg">保存配置</button>
+        <span id="saveHint"></span>
       </div>
     </section>
 
