@@ -14,6 +14,7 @@ import math
 import random
 import re
 import time
+from datetime import date, datetime
 
 # (正则, kind, spark, followup, note)
 _SPARK_RULES: list[tuple[str, str, float, int, str]] = [
@@ -86,4 +87,94 @@ def should_hit(
     return r < p
 
 
-__all__ = ["seed_for", "cooldown_days", "hit_probability", "should_hit"]
+# ---------- 重要日期：离日期越近，越容易被想起 ----------
+
+_DATE_ABS = re.compile(r"(\d{4})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})\s*[日号]?")
+_DATE_MD = re.compile(r"(?<![\d/.])(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]")
+_DATE_SLASH = re.compile(r"(?<![\d/.])(\d{1,2})\s*/\s*(\d{1,2})(?![\d/.])")
+_REL_DAYS = [
+    ("大后天", 3),
+    ("后天", 2),
+    ("明天", 1),
+    ("今天", 0),
+    ("下周", 7),
+    ("下个星期", 7),
+    ("下个月", 30),
+    ("这个月", 15),
+]
+
+
+def days_until(text: str, now: float | None = None) -> int | None:
+    """从一条记忆里猜「离那天还有几天」。猜不到返回 None。
+
+    支持：2026-11-25 / 11月25日 / 11/25 / 明天 / 后天 / 下周 / 下个月
+    """
+    t = str(text or "")
+    if not t:
+        return None
+    now_ts = time.time() if now is None else float(now)
+    today = datetime.fromtimestamp(now_ts).date()
+    for word, d in _REL_DAYS:
+        if word in t:
+            return d
+    m = _DATE_ABS.search(t)
+    if m:
+        try:
+            target = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+        return (target - today).days
+    m = _DATE_MD.search(t) or _DATE_SLASH.search(t)
+    if m:
+        mo, dd = int(m.group(1)), int(m.group(2))
+        try:
+            target = date(today.year, mo, dd)
+        except ValueError:
+            return None
+        delta = (target - today).days
+        if delta < -1:  # 今年已经过了，按明年算
+            try:
+                target = date(today.year + 1, mo, dd)
+            except ValueError:
+                return None
+            delta = (target - today).days
+        return delta
+    return None
+
+
+def date_proximity_factor(days: int | None) -> float:
+    """离得越近，倍率越高；过了就压低。"""
+    if days is None:
+        return 1.0
+    d = int(days)
+    if d < 0:
+        return 0.3
+    if d == 0:
+        return 2.0
+    if d <= 2:
+        return 1.6
+    if d <= 5:
+        return 1.3
+    if d <= 10:
+        return 1.0
+    if d <= 30:
+        return 0.6
+    return 0.3
+
+
+def proximity_factor(note: str, content: str, now: float | None = None) -> float:
+    """只对「重要日期」类火花按时效加权，别的返回 1.0。"""
+    if str(note or "") != "重要日期":
+        return 1.0
+    return date_proximity_factor(days_until(content, now))
+
+
+__all__ = [
+    "seed_for",
+    "cooldown_days",
+    "hit_probability",
+    "should_hit",
+    "days_until",
+    "date_proximity_factor",
+    "proximity_factor",
+]

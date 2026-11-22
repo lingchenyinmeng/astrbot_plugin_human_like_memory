@@ -604,6 +604,9 @@ class LingguangMemory(Star):
                     cd_days=cd,
                 )
                 * p_cfg["prob"]
+                * activation.proximity_factor(
+                    str(r.get("note") or ""), str(r.get("content") or "")
+                )
             )
             if p <= 0 or random.random() >= p:
                 continue
@@ -668,6 +671,9 @@ class LingguangMemory(Star):
                     cd_days=cd,
                 )
                 * cfg["prob"]
+                * activation.proximity_factor(
+                    str(r.get("note") or ""), str(r.get("content") or "")
+                )
             )
             if p <= 0 or random.random() >= p:
                 continue
