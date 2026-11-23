@@ -1169,7 +1169,14 @@ class LingguangMemory(Star):
             rel = "unrelated"
         for a in atoms:
             md = dict(a.metadata or {})
-            md["relevance"] = rel
+            # 逐条修正：别的对别人说的话，绝不可能算「对我说」
+            # （批里有人 @ 过她时，整批会被判 direct，这是之前误判的根源）
+            layer = str(getattr(a, "layer", "") or "")
+            txt = str(getattr(a, "content", "") or "")
+            if layer == "other_to_other":
+                md["relevance"] = "mention" if self._text_mentions_me(txt) else "about"
+            else:
+                md["relevance"] = rel
             a.metadata = md
         return atoms
 
