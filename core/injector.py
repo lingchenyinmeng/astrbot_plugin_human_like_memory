@@ -163,6 +163,8 @@ class Injector:
             "[你记得的事]\n"
             f"（现在是 {time.strftime('%Y-%m-%d %H:%M', time.localtime(now))}，"
             "下面都发生在过去）\n"
+            "注：下面记忆里的「我」= 你自己，「你」= 正在跟你说话的人；"
+            "用户发来的话里，「我」是用户自己、「你」是你。两边人称别搞反。\n"
         )
         tail = "\n[这些是背景，别机械复述，也别说「我记得」「你说过」；自然用。]"
         body = head + "\n".join(lines) + tail

@@ -107,33 +107,105 @@
     $("mask").classList.add("show");
     try {
       var a = await call("/atom", { id: id });
-      var rows = [
-        ["内容", a.content],
-        ["状态", a.status_cn],
-        ["谁对谁", a.layer_cn],
-        ["类型", a.type_cn + (a.subtype_cn ? " / " + a.subtype_cn : "")],
-        ["性质", (a.nature_cn || "未定性") + (a.nature ? "（" + a.nature_conf + "）" : "")],
-        ["说话人", (a.who_name || "-") + (a.who_id ? " (" + a.who_id + ")" : "")],
-        ["来源", a.source === "group" ? "群聊" : a.source === "private" ? "私聊" : "-"],
-        ["隐私", a.privacy === "sensitive" ? "私密（不外带）" : "普通"],
-        ["重要性", String(a.importance)],
-        ["时间", a.create_text + "（" + a.age + "）"],
-        ["分区", a.partition_key || "-"],
-        ["所属记忆", "#" + a.memory_id]
-      ];
-      var html = rows.map(function (r) {
-        return '<div class="row"><div class="k">' + r[0] + '</div><div class="v">' + esc(r[1]) + "</div></div>";
-      }).join("");
-      if (a.context && a.context.length) {
-        html += '<div class="row"><div class="k">上文</div><div class="v">';
-        a.context.forEach(function (c) {
-          html += '<div class="quote"><b>' + esc(c.who || "?") + "：</b>" + esc(c.text || "") + "</div>";
-        });
-        html += "</div></div>";
-      }
-      $("dBody").innerHTML = html;
+      renderAtom(a);
     } catch (e) {
       $("dBody").innerHTML = '<div class="empty">加载失败：' + esc(e.message) + "</div>";
+    }
+  }
+
+  function renderAtom(a) {
+    var rows = [
+      ["内容", a.content],
+      ["状态", a.status_cn],
+      ["谁对谁", a.layer_cn],
+      ["类型", a.type_cn + (a.subtype_cn ? " / " + a.subtype_cn : "")],
+      ["性质", (a.nature_cn || "未定性") + (a.nature ? "（" + a.nature_conf + "）" : "")],
+      ["说话人", (a.who_name || "-") + (a.who_id ? " (" + a.who_id + ")" : "")],
+      ["来源", a.source === "group" ? "群聊" : a.source === "private" ? "私聊" : "-"],
+      ["隐私", a.privacy === "sensitive" ? "私密（不外带）" : "普通"],
+      ["重要性", String(a.importance)],
+      ["时间", a.create_text + "（" + a.age + "）"],
+      ["分区", a.partition_key || "-"],
+      ["所属记忆", "#" + a.memory_id]
+    ];
+    var html = rows.map(function (r) {
+      return '<div class="row"><div class="k">' + r[0] + '</div><div class="v">' + esc(r[1]) + "</div></div>";
+    }).join("");
+    if (a.context && a.context.length) {
+      html += '<div class="row"><div class="k">上文</div><div class="v">';
+      a.context.forEach(function (c) {
+        html += '<div class="quote"><b>' + esc(c.who || "?") + "：</b>" + esc(c.text || "") + "</div>";
+      });
+      html += "</div></div>";
+    }
+    html += '<div class="act-bar">' +
+      '<button class="primary" id="atomEdit">编辑</button>' +
+      '<button class="ghost danger" id="atomDel">删除</button>' +
+      "</div>";
+    $("dBody").innerHTML = html;
+    $("atomEdit").addEventListener("click", function () { renderAtomEdit(a); });
+    $("atomDel").addEventListener("click", function () { deleteAtom(a.id); });
+  }
+
+  function renderAtomEdit(a) {
+    var statuses = [
+      ["active", "生效"], ["candidate", "暂存"],
+      ["dormant", "待定"], ["archived", "归档"]
+    ];
+    var opts = statuses.map(function (s) {
+      return '<option value="' + s[0] + '"' + (a.status === s[0] ? " selected" : "") + ">" + s[1] + "</option>";
+    }).join("");
+    var html =
+      '<div class="edit-form">' +
+      '<label class="el">内容</label>' +
+      '<textarea id="eContent" rows="5">' + esc(a.content) + "</textarea>" +
+      '<label class="el">重要性（0-1）</label>' +
+      '<input id="eImp" type="number" step="0.05" min="0" max="1" value="' + a.importance + '">' +
+      '<label class="el">说话人</label>' +
+      '<input id="eWho" type="text" value="' + esc(a.who_name || "") + '">' +
+      '<label class="el">状态</label>' +
+      '<select id="eStatus">' + opts + "</select>" +
+      '<div class="act-bar"><button class="primary" id="atomSave">保存</button>' +
+      '<button class="ghost" id="atomCancel">取消</button></div>' +
+      "</div>";
+    $("dBody").innerHTML = html;
+    $("atomCancel").addEventListener("click", function () { renderAtom(a); });
+    $("atomSave").addEventListener("click", function () { saveAtom(a); });
+  }
+
+  async function saveAtom(a) {
+    if (!api || !api.apiPost) { alert("桥接不支持 POST"); return; }
+    var body = {
+      atom_id: a.id,
+      content: $("eContent").value,
+      importance: parseFloat($("eImp").value),
+      who_name: $("eWho").value,
+      status: $("eStatus").value
+    };
+    try {
+      $("atomSave").disabled = true;
+      await api.apiPost(PREFIX + "/atom/update", body);
+      loadMemories();
+      loadStats();
+      var fresh = await call("/atom", { id: a.id });
+      renderAtom(fresh);
+      $("dBody").scrollTop = 0;
+    } catch (e) {
+      alert("保存失败：" + e.message);
+      $("atomSave").disabled = false;
+    }
+  }
+
+  async function deleteAtom(id) {
+    if (!confirm("确定删除记忆 #" + id + "？删了就找不回来了。")) return;
+    if (!api || !api.apiPost) { alert("桥接不支持 POST"); return; }
+    try {
+      await api.apiPost(PREFIX + "/atom/delete", { atom_id: id });
+      $("mask").classList.remove("show");
+      loadMemories();
+      loadStats();
+    } catch (e) {
+      alert("删除失败：" + e.message);
     }
   }
 

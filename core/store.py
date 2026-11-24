@@ -1053,6 +1053,81 @@ class MemoryStore:
             await db.commit()
             return cursor.rowcount > 0
 
+    async def update_atom_fields(
+        self,
+        atom_id: int,
+        *,
+        content: str | None = None,
+        importance: float | None = None,
+        who_name: str | None = None,
+        status: str | None = None,
+    ) -> bool:
+        """面板手动改一条记忆（内容/重要性/说话人/状态），索引一起更新。"""
+        sets: list[str] = []
+        params: list = []
+        new_content: str | None = None
+        if content is not None:
+            c = str(content).strip()
+            if c:
+                new_content = c
+                sets.append("content = ?")
+                params.append(c)
+        if importance is not None:
+            try:
+                imp = max(0.0, min(1.0, float(importance)))
+                sets.append("importance = ?")
+                params.append(imp)
+            except (TypeError, ValueError):
+                pass
+        if who_name is not None:
+            sets.append("who_name = ?")
+            params.append(str(who_name).strip()[:40])
+        if status is not None and status in (
+            AtomStatus.ACTIVE.value,
+            AtomStatus.CANDIDATE.value,
+            AtomStatus.DORMANT.value,
+            AtomStatus.ARCHIVED.value,
+        ):
+            sets.append("status = ?")
+            params.append(status)
+        if not sets:
+            return False
+        async with self._connect() as db:
+            cur = await db.execute(
+                f"UPDATE atoms SET {', '.join(sets)} WHERE id = ?",
+                list(params) + [int(atom_id)],
+            )
+            ok = cur.rowcount > 0
+            if new_content:
+                cur2 = await db.execute(
+                    "UPDATE atoms_fts SET content = ? WHERE atom_id = ?",
+                    (new_content, int(atom_id)),
+                )
+                if cur2.rowcount == 0:
+                    await db.execute(
+                        "INSERT INTO atoms_fts(atom_id, content) VALUES (?, ?)",
+                        (int(atom_id), new_content),
+                    )
+            await db.commit()
+        return ok
+
+    async def delete_atom(self, atom_id: int) -> bool:
+        """真删一条记忆：索引、向量、活化一起清掉。"""
+        aid = int(atom_id)
+        async with self._connect() as db:
+            cur = await db.execute("SELECT id FROM atoms WHERE id = ?", (aid,))
+            if await cur.fetchone() is None:
+                return False
+            await db.execute("DELETE FROM atoms_fts WHERE atom_id = ?", (aid,))
+            for table in ("atom_vectors", "activations"):
+                try:
+                    await db.execute(f"DELETE FROM {table} WHERE atom_id = ?", (aid,))
+                except Exception:
+                    pass
+            await db.execute("DELETE FROM atoms WHERE id = ?", (aid,))
+            await db.commit()
+        return True
+
     async def nature_history(self, atom_id: int, limit: int = 20) -> list[dict]:
         """一条原子的改判历史，最近的在前面。"""
         async with self._connect() as db:

@@ -143,6 +143,8 @@ class PageApi:
         register(f"{PAGE_API_PREFIX}/stats", self.get_stats, ["GET"], "HLM stats")
         register(f"{PAGE_API_PREFIX}/atoms", self.list_atoms, ["GET"], "HLM atoms")
         register(f"{PAGE_API_PREFIX}/atom", self.get_atom, ["GET"], "HLM atom detail")
+        register(f"{PAGE_API_PREFIX}/atom/update", self.update_atom, ["POST"], "HLM atom update")
+        register(f"{PAGE_API_PREFIX}/atom/delete", self.delete_atom, ["POST"], "HLM atom delete")
         register(f"{PAGE_API_PREFIX}/people", self.list_people, ["GET"], "HLM people")
         register(f"{PAGE_API_PREFIX}/person", self.get_person, ["GET"], "HLM person detail")
         register(f"{PAGE_API_PREFIX}/relations", self.list_relations, ["GET"], "HLM relations")
@@ -278,6 +280,52 @@ class PageApi:
         data["context"] = atom.context if isinstance(atom.context, list) else []
         data["metadata"] = atom.metadata if isinstance(atom.metadata, dict) else {}
         return json_response({"status": "ok", "data": data})
+
+    async def update_atom(self):
+        store = getattr(self.plugin, "store", None)
+        if store is None:
+            return json_response({"status": "error", "message": "插件还没初始化"}, status_code=503)
+        body = await request.json({}) or {}
+        try:
+            aid = int(body.get("atom_id") or 0)
+        except (TypeError, ValueError):
+            aid = 0
+        if not aid:
+            return json_response({"status": "error", "message": "缺少 atom_id"}, status_code=400)
+        try:
+            ok = await store.update_atom_fields(
+                aid,
+                content=body.get("content"),
+                importance=body.get("importance"),
+                who_name=body.get("who_name"),
+                status=body.get("status"),
+            )
+            return json_response(
+                {"status": "ok" if ok else "error", "message": "" if ok else "没有可改的字段"}
+            )
+        except Exception as e:
+            logger.warning(f"[human_like_mem] 改记忆失败: {e!r}")
+            return json_response({"status": "error", "message": str(e)[:200]}, status_code=500)
+
+    async def delete_atom(self):
+        store = getattr(self.plugin, "store", None)
+        if store is None:
+            return json_response({"status": "error", "message": "插件还没初始化"}, status_code=503)
+        body = await request.json({}) or {}
+        try:
+            aid = int(body.get("atom_id") or 0)
+        except (TypeError, ValueError):
+            aid = 0
+        if not aid:
+            return json_response({"status": "error", "message": "缺少 atom_id"}, status_code=400)
+        try:
+            ok = await store.delete_atom(aid)
+            return json_response(
+                {"status": "ok" if ok else "error", "message": "" if ok else "没找到这条记忆"}
+            )
+        except Exception as e:
+            logger.warning(f"[human_like_mem] 删记忆失败: {e!r}")
+            return json_response({"status": "error", "message": str(e)[:200]}, status_code=500)
 
     # ---------- 人物 ----------
 
